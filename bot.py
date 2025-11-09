@@ -484,7 +484,6 @@ async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # --- Group Management Commands (Admin/Owner Required) ---
-# (Existing functions like warn_user, remove_warn, etc. are retained below)
 
 async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Warns a user and tracks the count. Kicks/bans on reaching 3 warnings."""
@@ -813,6 +812,72 @@ async def handle_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error(f"Error checking/handling filters: {e}")
 
+# --- Owner-Only Commands ---
+
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only command to broadcast a message to all tracked chats."""
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("This command is restricted to the bot owner.")
+        return
+    
+    # We expect the full message content after the command, e.g., /broadcast Hello world!
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode="Markdown")
+        return
+
+    if not db:
+        await update.message.reply_text("Database not available. Cannot broadcast.")
+        return
+
+    # Extract the message content (skipping the /broadcast command and the space)
+    # update.message.text is like "/broadcast Hello world!", args are ["Hello", "world!"]
+    # We join the args back into a single string.
+    message_to_send = update.message.text.split(" ", 1)[1]
+    
+    # 1. Fetch all chat IDs from the 'broadcast_chats' collection
+    chats_ref = db.collection("broadcast_chats")
+    try:
+        chats_snapshot = chats_ref.stream()
+        
+        sent_count = 0
+        failed_count = 0
+        
+        # Determine the source chat ID to skip sending the broadcast back to the owner's chat
+        source_chat_id = str(update.effective_chat.id)
+
+        for doc in chats_snapshot:
+            chat_data = doc.to_dict()
+            chat_id = chat_data.get("chat_id")
+            
+            if not chat_id or chat_id == source_chat_id:
+                continue
+
+            try:
+                # 2. Send the message to each chat
+                # We use HTML parsing for formatting (bold, links, etc.)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message_to_send,
+                    parse_mode="HTML"
+                )
+                sent_count += 1
+            except Exception as e:
+                # Catch exceptions like 'Bot was blocked by the user', 'Chat not found', etc.
+                logger.warning(f"Failed to send broadcast to chat {chat_id}: {e}")
+                failed_count += 1
+                
+        # 3. Report the result back to the owner
+        await update.message.reply_text(
+            f"✅ Broadcast complete!\n"
+            f"Sent to **{sent_count}** chats.\n"
+            f"Failed to send to **{failed_count}** chats (likely blocked or left the group).",
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error during broadcast: {e}")
+        await update.message.reply_text(f"An unexpected database error occurred during broadcast: {e}")
+
 
 # --- Main Application Setup ---
 
@@ -855,7 +920,7 @@ def main() -> None:
     application.add_handler(CommandHandler("ban_word", ban_word))
     application.add_handler(CommandHandler("unban_word", unban_word))
 
-    # Owner-Only Commands
+    # Owner-Only Commands (FIXED: broadcast_message is now defined)
     application.add_handler(CommandHandler("broadcast", broadcast_message))
 
     # Message Handlers (must run on TEXT messages that are NOT commands)
