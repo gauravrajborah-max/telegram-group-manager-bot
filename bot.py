@@ -3,7 +3,8 @@ import logging
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta, timezone
-from firebase_admin import initialize_app, firestore, credentials
+# Import firestore package directly for SERVER_TIMESTAMP
+from firebase_admin import initialize_app, firestore, credentials 
 
 # --- Configuration and Initialization ---
 
@@ -47,6 +48,9 @@ def is_owner(user_id: int) -> bool:
 async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Checks if the user is an admin or the bot owner."""
     if update.effective_chat.type not in ["group", "supergroup", "channel"]:
+        # Allow owner commands outside of groups for testing/private chat control
+        if is_owner(update.effective_user.id):
+            return True
         await update.message.reply_text("This command only works in groups/channels.")
         return False
 
@@ -74,6 +78,14 @@ def get_filter_ref(group_id: int, keyword: str):
     # Use lowercase and stripped keyword for document ID for consistency
     safe_keyword = keyword.strip().lower().replace(" ", "_")
     return db.collection("groups").document(str(group_id)).collection("filters").document(safe_keyword)
+
+def get_banned_word_ref(group_id: int, word: str):
+    """Returns the Firestore document reference for a banned word."""
+    if not db:
+        return None
+    safe_word = word.strip().lower().replace(" ", "_")
+    # Using a subcollection named 'banned_words' inside the group document
+    return db.collection("groups").document(str(group_id)).collection("banned_words").document(safe_word)
 
 async def get_warn_count(group_id: int, user_id: int) -> int:
     """Fetches the current warning count for a user."""
@@ -103,12 +115,31 @@ async def update_warn_count(group_id: int, user_id: int, change: int):
 # --- Utility Commands ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message with bot information."""
+    """Sends a welcome message with bot information and tracks the chat for broadcasting."""
     await update.message.reply_text(
         "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
-        "Just add the bot to your group and give the admin rights and you're good to go👌"
+        "You can manage a group chat using this bot. Always adding new features. Just try it—"
         "\n\nThank you🦚"
     )
+
+    # --- Track chat for broadcast functionality in the global 'broadcast_chats' collection ---
+    if db and update.effective_chat.type in ["group", "supergroup", "private"]:
+        chat_id = str(update.effective_chat.id)
+        chat_ref = db.collection("broadcast_chats").document(chat_id)
+        
+        chat_data = {
+            "chat_id": chat_id,
+            "chat_type": update.effective_chat.type,
+            "title": update.effective_chat.title or update.effective_user.full_name, 
+            "last_active": firestore.SERVER_TIMESTAMP,
+        }
+        
+        try:
+            chat_ref.set(chat_data, merge=True)
+            logger.info(f"Chat {chat_id} added/updated for broadcast list.")
+        except Exception as e:
+            logger.error(f"Failed to add chat to broadcast list: {e}")
+
 
 async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shows the user ID of the sender or a replied user."""
@@ -122,7 +153,280 @@ async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown"
     )
 
+# --- Countdown Commands ---
+
+async def set_countdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sets a group-wide countdown to a specific date."""
+    if not await check_admin(update, context): return
+    if not db: 
+        await update.message.reply_text("Database not available.")
+        return
+
+    # Expected format: /set_countdown DD/MM/YYYY Name of the event
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: `/set_countdown DD/MM/YYYY <Name of the event>` (e.g., `/set_countdown 31/12/2025 New Year's Eve`)", parse_mode="Markdown")
+        return
+
+    date_str = context.args[0]
+    countdown_name = " ".join(context.args[1:])
+    group_id = update.effective_chat.id
+    
+    try:
+        # Note: Timezone is set to UTC for safe comparison
+        target_date = datetime.strptime(date_str, "%d/%m/%Y").replace(tzinfo=timezone.utc)
+        if target_date < datetime.now(timezone.utc):
+            await update.message.reply_text("The target date must be in the future.")
+            return
+
+        # Store countdown in group_settings document
+        ref = db.collection("group_settings").document(str(group_id))
+        ref.set({
+            "countdown_name": countdown_name,
+            "target_date_iso": target_date.isoformat(),
+            "target_date_human": date_str
+        }, merge=True)
+
+        await update.message.reply_text(
+            f"🚀 Countdown for **{countdown_name}** set successfully!\nTarget date: `{date_str}`. Use `/check_countdown` to see the remaining time.",
+            parse_mode="Markdown"
+        )
+
+    except ValueError:
+        await update.message.reply_text("Invalid date format. Please use DD/MM/YYYY.")
+    except Exception as e:
+        logger.error(f"Error setting countdown: {e}")
+        await update.message.reply_text(f"An unexpected error occurred: {e}")
+
+
+async def check_countdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks and displays the remaining time for the group-wide countdown."""
+    if not db: 
+        await update.message.reply_text("Database not available.")
+        return
+
+    group_id = update.effective_chat.id
+    # Countdown is stored in the group_settings document
+    ref = db.collection("group_settings").document(str(group_id))
+
+    try:
+        doc = ref.get().to_dict()
+        if not doc or "target_date_iso" not in doc:
+            await update.message.reply_text("No active countdown set for this chat. Use `/set_countdown` to start one.")
+            return
+
+        target_date_iso = doc["target_date_iso"]
+        countdown_name = doc["countdown_name"]
+        target_date_human = doc["target_date_human"]
+        
+        target_date = datetime.fromisoformat(target_date_iso).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        
+        remaining_time = target_date - now
+
+        if remaining_time.total_seconds() <= 0:
+            # Clear old countdown
+            ref.update({
+                "countdown_name": firestore.DELETE_FIELD,
+                "target_date_iso": firestore.DELETE_FIELD,
+                "target_date_human": firestore.DELETE_FIELD
+            })
+            await update.message.reply_text(f"🎉 **{countdown_name}** is here! The countdown has finished.")
+            return
+        
+        # Format remaining time
+        days = remaining_time.days
+        # calculate remaining hours, minutes, seconds from the remaining_time.seconds attribute
+        hours = remaining_time.seconds // 3600
+        minutes = (remaining_time.seconds % 3600) // 60
+        seconds = remaining_time.seconds % 60
+        
+        await update.message.reply_text(
+            f"⏳ **{countdown_name}**\n"
+            f"Target: `{target_date_human}`\n\n"
+            f"**Time Remaining:**\n"
+            f"• `{days}` days\n"
+            f"• `{hours}` hours\n"
+            f"• `{minutes}` minutes\n"
+            f"• `{seconds}` seconds",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Error checking countdown: {e}")
+        await update.message.reply_text(f"An error occurred while checking the countdown: {e}")
+
+# --- Lock/Unlock Commands ---
+
+async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE, lock: bool) -> None:
+    """Handles /lock and /unlock commands for various features."""
+    if not await check_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/lock <feature>` or `/unlock <feature>`. Features: `all`, `text`, `stickers`, `media`, `images`, `audio`.", parse_mode="Markdown")
+        return
+
+    feature_arg = context.args[0].lower()
+    group_id = update.effective_chat.id
+    
+    # We start with the most permissive base setting, and then modify the target permission(s).
+    # set_chat_permissions replaces the ENTIRE permission set.
+    permissions = ChatPermissions(
+        can_send_messages=True, can_send_audios=True, can_send_documents=True,
+        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+        can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+        can_add_web_page_previews=True, can_send_stickers=True, can_send_animations=True
+    )
+    
+    # Map feature names to the ChatPermissions attributes
+    targets = []
+    
+    if feature_arg == "all":
+        # Lock all means setting can_send_messages to False, which implicitly disables almost everything else.
+        # Unlock all means setting can_send_messages to True, which implicitly enables almost everything else.
+        permissions.can_send_messages = not lock 
+    elif feature_arg == "text":
+        permissions.can_send_messages = not lock
+    elif feature_arg == "stickers":
+        permissions.can_send_stickers = not lock
+        permissions.can_send_animations = not lock
+    elif feature_arg == "media":
+        # All media types
+        permissions.can_send_photos = not lock
+        permissions.can_send_videos = not lock
+        permissions.can_send_documents = not lock
+        permissions.can_send_audios = not lock
+        permissions.can_send_voice_notes = not lock
+        permissions.can_send_video_notes = not lock
+        permissions.can_send_other_messages = not lock # Covers animations/games
+    elif feature_arg == "images":
+        permissions.can_send_photos = not lock
+    elif feature_arg == "audio":
+        permissions.can_send_audios = not lock
+        permissions.can_send_voice_notes = not lock
+    else:
+        await update.message.reply_text("Invalid feature. Choose from: `all`, `text`, `stickers`, `media`, `images`, `audio`.", parse_mode="Markdown")
+        return
+
+    try:
+        # Use set_chat_permissions to change default permissions for the group
+        await context.bot.set_chat_permissions(chat_id=group_id, permissions=permissions)
+        action = "LOCKED" if lock else "UNLOCKED"
+        await update.message.reply_text(
+            f"🔒 Feature **'{feature_arg.upper()}'** successfully **{action}** for general members.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Could not update chat permissions. Make sure the bot is an admin with 'manage group' permissions. Error: {e}")
+
+async def lock_feature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Locks a specific feature."""
+    await handle_lock_unlock(update, context, True)
+
+async def unlock_feature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unlocks a specific feature."""
+    await handle_lock_unlock(update, context, False)
+
+# --- Banned Word Commands ---
+
+async def ban_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bans a word from the group and stores it in Firestore."""
+    if not await check_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/ban_word <word>` (e.g., `/ban_word spam`)")
+        return
+    if not db:
+        await update.message.reply_text("Database not available.")
+        return
+
+    word = context.args[0].lower().strip()
+    group_id = update.effective_chat.id
+    ref = get_banned_word_ref(group_id, word)
+
+    try:
+        ref.set({"word": word, "timestamp": firestore.SERVER_TIMESTAMP})
+        await update.message.reply_text(
+            f"🚫 Word **'{word}'** has been successfully banned. Messages containing this word will be deleted.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error banning word: {e}")
+        await update.message.reply_text(f"Failed to ban word due to a database error: {e}")
+
+async def unban_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unbans a word and removes it from Firestore."""
+    if not await check_admin(update, context): return
+    if not context.args:
+        await update.message.reply_text("Usage: `/unban_word <word>`")
+        return
+    if not db:
+        await update.message.reply_text("Database not available.")
+        return
+
+    word = context.args[0].lower().strip()
+    group_id = update.effective_chat.id
+    ref = get_banned_word_ref(group_id, word)
+
+    try:
+        if ref.get().exists:
+            ref.delete()
+            await update.message.reply_text(
+                f"✅ Word **'{word}'** has been successfully unbanned.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"Word **'{word}'** was not found in the banned list.")
+    except Exception as e:
+        logger.error(f"Error unbanning word: {e}")
+        await update.message.reply_text(f"Failed to unban word due to a database error: {e}")
+
+async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Intercepts messages, checks for banned words, and deletes the message if found."""
+    if not db or not update.message.text:
+        return
+    
+    # Do not check/delete messages from admins or owner
+    try:
+        if await check_admin(update, context):
+            return
+    except:
+        # Skip if check_admin fails (e.g., in a non-group chat where broadcast is used)
+        pass 
+
+    message = update.message
+    message_text = message.text.lower()
+    group_id = update.effective_chat.id
+
+    # The banned words are stored in a subcollection under the group document
+    banned_words_ref = db.collection("groups").document(str(group_id)).collection("banned_words")
+    
+    try:
+        banned_words_snapshot = banned_words_ref.stream()
+        
+        for doc in banned_words_snapshot:
+            word = doc.to_dict().get("word", "")
+            
+            # Check for banned word existence in the message
+            if word and word in message_text:
+                # Delete the message
+                try:
+                    await message.delete()
+                    
+                    # Notify the user (using the group chat_id)
+                    await context.bot.send_message(
+                        chat_id=group_id,
+                        text=f"⚠️ {message.from_user.mention_html()}, your message was deleted for using a banned word: **{word}**.",
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to delete banned word message or send warning: {e}")
+                    # If deletion fails (bot lacks permission), just log and move on.
+                return # Stop checking after the first match
+                
+    except Exception as e:
+        logger.error(f"Error handling banned words: {e}")
+
+
 # --- Group Management Commands (Admin/Owner Required) ---
+# (Existing functions like warn_user, remove_warn, etc. are retained below)
 
 async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Warns a user and tracks the count. Kicks/bans on reaching 3 warnings."""
@@ -280,7 +584,7 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     group_id = update.effective_chat.id
 
     try:
-        # Give back all permissions (unmute)
+        # Give back all default permissions (unmute)
         await context.bot.restrict_chat_member(
             group_id,
             target_user.id,
@@ -354,8 +658,7 @@ async def set_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     keyword = context.args[0]
     group_id = update.effective_chat.id
-    ref = get_filter_ref(group_id, keyword)
-    if not ref: return
+    ref = db.collection("groups").document(str(group_id)).collection("filters").document(keyword.lower().strip())
     
     filter_data = {"keyword": keyword}
 
@@ -399,8 +702,7 @@ async def stop_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     keyword = context.args[0]
     group_id = update.effective_chat.id
-    ref = get_filter_ref(group_id, keyword)
-    if not ref: return
+    ref = db.collection("groups").document(str(group_id)).collection("filters").document(keyword.lower().strip())
 
     try:
         # Check if the filter exists before deleting
@@ -422,7 +724,6 @@ async def handle_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
         
     group_id = update.effective_chat.id
-    # Ensure checking against the raw text, not just the command-stripped text
     message_text = update.message.text.lower()
 
     # Get the reference to the filters collection for this group
@@ -460,7 +761,7 @@ async def handle_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # --- Owner-Only Commands ---
 
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner command to broadcast a message to a hardcoded list of chats (if needed) or just reply to the message."""
+    """Owner command to broadcast a message to all tracked chats in Firestore."""
     if not is_owner(update.effective_user.id):
         await update.message.reply_text("🚫 This command is reserved for the bot owner only.")
         return
@@ -468,18 +769,39 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not context.args:
         await update.message.reply_text("Please provide the message content to broadcast.")
         return
+    
+    if not db:
+        await update.message.reply_text("Broadcast failed: Database not initialized.")
+        return
 
     message_text = " ".join(context.args)
+    chats_ref = db.collection("broadcast_chats")
     
-    # --- Owner-Only Broadcast Logic ---
-    # NOTE: To implement a real broadcast to multiple groups, you would need to store 
-    # all group IDs in a separate Firestore collection and iterate over them.
-    # For a simple starting point, we will just confirm the owner command.
-    
-    await update.message.reply_text(
-        f"Owner Broadcast initiated. (To make this work across multiple chats, you need to set up a system to track all chat IDs in Firestore.)\n\nMessage: *{message_text}*",
-        parse_mode="Markdown"
-    )
+    try:
+        chats_to_broadcast = chats_ref.stream()
+        
+        success_count = 0
+        fail_count = 0
+        
+        # Iterate over all stored chat IDs
+        for doc in chats_to_broadcast:
+            chat_id_str = doc.id # Document ID is the Chat ID
+            try:
+                # Send the message. This will fail if the bot has been removed from the chat.
+                await context.bot.send_message(chat_id=chat_id_str, text=message_text, parse_mode="Markdown")
+                success_count += 1
+            except Exception as e:
+                # This is expected for chats where the bot was removed.
+                logger.warning(f"Failed to broadcast to chat {chat_id_str} (Type: {doc.to_dict().get('chat_type', 'unknown')}): {e}")
+                fail_count += 1
+
+        await update.message.reply_text(
+            f"✅ **Broadcast Complete!**\nSent message to *{success_count}* chats.\nFailed to send to *{fail_count}* chats (likely due to the bot being removed or permissions issues).",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error during broadcast operation: {e}")
+        await update.message.reply_text(f"An unexpected error occurred during the broadcast operation: {e}")
 
 
 # --- Main Application Setup ---
@@ -499,6 +821,10 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("id", get_user_id))
 
+    # Countdown Commands
+    application.add_handler(CommandHandler("set_countdown", set_countdown))
+    application.add_handler(CommandHandler("check_countdown", check_countdown))
+
     # Admin/Management Commands
     application.add_handler(CommandHandler("warn", warn_user))
     application.add_handler(CommandHandler("removewarn", remove_warn))
@@ -511,12 +837,20 @@ def main() -> None:
     application.add_handler(CommandHandler("filter", set_filter))
     application.add_handler(CommandHandler("stop", stop_filter))
 
+    # Lock/Unlock Commands
+    application.add_handler(CommandHandler("lock", lock_feature))
+    application.add_handler(CommandHandler("unlock", unlock_feature))
+
+    # Banned Word Commands
+    application.add_handler(CommandHandler("ban_word", ban_word))
+    application.add_handler(CommandHandler("unban_word", unban_word))
 
     # Owner-Only Commands
     application.add_handler(CommandHandler("broadcast", broadcast_message))
 
-    # Message Handler for Filters (must run on TEXT messages that are NOT commands)
+    # Message Handlers (must run on TEXT messages that are NOT commands)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_filters))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_banned_words))
 
 
     # --- Start Webhook (for Render/Cloud Hosting) ---
