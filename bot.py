@@ -106,7 +106,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Sends a welcome message with bot information."""
     await update.message.reply_text(
         "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
-        "You can contact the owner through this bot. Just type your message—"
+        "Just add the bot to your group and give the admin rights and you're good to go👌"
         "\n\nThank you🦚"
     )
 
