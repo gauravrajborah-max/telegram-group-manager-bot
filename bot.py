@@ -118,7 +118,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Sends a welcome message with bot information and tracks the chat for broadcasting."""
     await update.message.reply_text(
         "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
-        "you can manage a gc using this bot. Continuously workin to make it better. Just have a try—"
+        "You can contact the owner through this bot. Just type your message—"
         "\n\nThank you🦚"
     )
 
@@ -267,47 +267,93 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
     feature_arg = context.args[0].lower()
     group_id = update.effective_chat.id
     
-    # We start with the most permissive base setting, and then modify the target permission(s).
-    # set_chat_permissions replaces the ENTIRE permission set.
-    # FIX: Removed 'can_send_stickers' and 'can_send_animations'. They are covered by 'can_send_other_messages'.
-    permissions = ChatPermissions(
-        can_send_messages=True, can_send_audios=True, can_send_documents=True,
-        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-        can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-        can_add_web_page_previews=True
-    )
+    # --- New Logic: Use a dictionary to hold the new permissions based on lock status ---
     
+    # Start with all permissions enabled (as a fallback/default)
+    new_perms = {
+        "can_send_messages": True,
+        "can_send_audios": True,
+        "can_send_documents": True,
+        "can_send_photos": True,
+        "can_send_videos": True,
+        "can_send_video_notes": True,
+        "can_send_voice_notes": True,
+        "can_send_polls": True,
+        "can_send_other_messages": True,
+        "can_add_web_page_previews": True
+    }
+    
+    # Fetch current permissions from the chat to ensure we only change the requested feature
+    try:
+        current_chat = await context.bot.get_chat(group_id)
+        # Use the current chat permissions as the baseline if available
+        if current_chat.permissions:
+             # NOTE: If any of these properties are None (e.g., if Telegram hasn't set them explicitly), 
+             # we default to True, assuming default group member permissions are permissive.
+             new_perms = {
+                "can_send_messages": current_chat.permissions.can_send_messages if current_chat.permissions.can_send_messages is not None else True,
+                "can_send_audios": current_chat.permissions.can_send_audios if current_chat.permissions.can_send_audios is not None else True,
+                "can_send_documents": current_chat.permissions.can_send_documents if current_chat.permissions.can_send_documents is not None else True,
+                "can_send_photos": current_chat.permissions.can_send_photos if current_chat.permissions.can_send_photos is not None else True,
+                "can_send_videos": current_chat.permissions.can_send_videos if current_chat.permissions.can_send_videos is not None else True,
+                "can_send_video_notes": current_chat.permissions.can_send_video_notes if current_chat.permissions.can_send_video_notes is not None else True,
+                "can_send_voice_notes": current_chat.permissions.can_send_voice_notes if current_chat.permissions.can_send_voice_notes is not None else True,
+                "can_send_polls": current_chat.permissions.can_send_polls if current_chat.permissions.can_send_polls is not None else True,
+                "can_send_other_messages": current_chat.permissions.can_send_other_messages if current_chat.permissions.can_send_other_messages is not None else True,
+                "can_add_web_page_previews": current_chat.permissions.can_add_web_page_previews if current_chat.permissions.can_add_web_page_previews is not None else True,
+            }
+    except Exception as e:
+        logger.warning(f"Could not fetch current chat permissions, defaulting to all True: {e}")
+        # If fetching fails, we keep the permissive default `new_perms` defined above.
+
+
+    # Determine the target value (False for lock, True for unlock)
+    target_value = not lock 
+
     if feature_arg == "all":
         # Lock all means setting can_send_messages to False, which implicitly disables almost everything else.
-        permissions.can_send_messages = not lock 
+        new_perms["can_send_messages"] = target_value
         # Also explicitly restrict other messages (stickers/animations)
-        permissions.can_send_other_messages = not lock 
+        new_perms["can_send_other_messages"] = target_value
+        # Restrict everything else for a full lock/unlock
+        new_perms["can_send_audios"] = target_value
+        new_perms["can_send_documents"] = target_value
+        new_perms["can_send_photos"] = target_value
+        new_perms["can_send_videos"] = target_value
+        new_perms["can_send_video_notes"] = target_value
+        new_perms["can_send_voice_notes"] = target_value
+        new_perms["can_send_polls"] = target_value
+        new_perms["can_add_web_page_previews"] = target_value
+        
     elif feature_arg == "text":
-        permissions.can_send_messages = not lock
+        new_perms["can_send_messages"] = target_value
     elif feature_arg == "stickers":
-        # FIX: Stickers, animations (GIFs), and games are usually controlled by this flag
-        permissions.can_send_other_messages = not lock
+        # Stickers, animations (GIFs), and games are usually controlled by this flag
+        new_perms["can_send_other_messages"] = target_value
     elif feature_arg == "media":
         # All media types
-        permissions.can_send_photos = not lock
-        permissions.can_send_videos = not lock
-        permissions.can_send_documents = not lock
-        permissions.can_send_audios = not lock
-        permissions.can_send_voice_notes = not lock
-        permissions.can_send_video_notes = not lock
-        permissions.can_send_other_messages = not lock # Covers animations/games
+        new_perms["can_send_photos"] = target_value
+        new_perms["can_send_videos"] = target_value
+        new_perms["can_send_documents"] = target_value
+        new_perms["can_send_audios"] = target_value
+        new_perms["can_send_voice_notes"] = target_value
+        new_perms["can_send_video_notes"] = target_value
+        new_perms["can_send_other_messages"] = target_value # Covers animations/games
     elif feature_arg == "images":
-        permissions.can_send_photos = not lock
+        new_perms["can_send_photos"] = target_value
     elif feature_arg == "audio":
-        permissions.can_send_audios = not lock
-        permissions.can_send_voice_notes = not lock
+        new_perms["can_send_audios"] = target_value
+        new_perms["can_send_voice_notes"] = target_value
     else:
         await update.message.reply_text("Invalid feature. Choose from: `all`, `text`, `stickers`, `media`, `images`, `audio`.", parse_mode="Markdown")
         return
+    
+    # Recreate the ChatPermissions object with the new dictionary
+    final_permissions = ChatPermissions(**new_perms)
 
     try:
         # Use set_chat_permissions to change default permissions for the group
-        await context.bot.set_chat_permissions(chat_id=group_id, permissions=permissions)
+        await context.bot.set_chat_permissions(chat_id=group_id, permissions=final_permissions)
         action = "LOCKED" if lock else "UNLOCKED"
         await update.message.reply_text(
             f"🔒 Feature **'{feature_arg.upper()}'** successfully **{action}** for general members.",
@@ -384,11 +430,24 @@ async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Do not check/delete messages from admins or owner
     try:
-        if await check_admin(update, context):
+        # Check admin status without reply, as this is a message handler
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        is_user_admin = False
+        if is_owner(user_id):
+            is_user_admin = True
+        elif update.effective_chat.type in ["group", "supergroup", "channel"]:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status in ["creator", "administrator"]:
+                is_user_admin = True
+
+        if is_user_admin:
             return
-    except:
-        # Skip if check_admin fails (e.g., in a non-group chat where broadcast is used)
-        pass 
+            
+    except Exception as e:
+        logger.warning(f"Failed to check admin status in handle_banned_words: {e}")
+        # Continue execution, better safe than sorry
 
     message = update.message
     message_text = message.text.lower()
@@ -559,6 +618,7 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     mute_until = datetime.now(timezone.utc) + timedelta(seconds=mute_seconds)
 
     try:
+        # Mute means can_send_messages=False, and all other permissions are also set to False by default
         await context.bot.restrict_chat_member(
             group_id,
             target_user.id,
@@ -584,7 +644,7 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     try:
         # Give back all default permissions (unmute)
-        # FIX: Removed invalid ChatPermissions arguments like can_send_stickers, can_change_info, etc.
+        # Permissions are all set to True to ensure they can send all types of messages again
         await context.bot.restrict_chat_member(
             group_id,
             target_user.id,
@@ -752,52 +812,6 @@ async def handle_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         logger.error(f"Error checking/handling filters: {e}")
-
-
-# --- Owner-Only Commands ---
-
-async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner command to broadcast a message to all tracked chats in Firestore."""
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("🚫 This command is reserved for the bot owner only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Please provide the message content to broadcast.")
-        return
-    
-    if not db:
-        await update.message.reply_text("Broadcast failed: Database not initialized.")
-        return
-
-    message_text = " ".join(context.args)
-    chats_ref = db.collection("broadcast_chats")
-    
-    try:
-        chats_to_broadcast = chats_ref.stream()
-        
-        success_count = 0
-        fail_count = 0
-        
-        # Iterate over all stored chat IDs
-        for doc in chats_to_broadcast:
-            chat_id_str = doc.id # Document ID is the Chat ID
-            try:
-                # Send the message. This will fail if the bot has been removed from the chat.
-                await context.bot.send_message(chat_id=chat_id_str, text=message_text, parse_mode="Markdown")
-                success_count += 1
-            except Exception as e:
-                # This is expected for chats where the bot was removed.
-                logger.warning(f"Failed to broadcast to chat {chat_id_str} (Type: {doc.to_dict().get('chat_type', 'unknown')}): {e}")
-                fail_count += 1
-
-        await update.message.reply_text(
-            f"✅ **Broadcast Complete!**\nSent message to *{success_count}* chats.\nFailed to send to *{fail_count}* chats (likely due to the bot being removed or permissions issues).",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Error during broadcast operation: {e}")
-        await update.message.reply_text(f"An unexpected error occurred during the broadcast operation: {e}")
 
 
 # --- Main Application Setup ---
