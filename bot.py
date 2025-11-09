@@ -67,6 +67,14 @@ def get_user_ref(group_id: int, user_id: int):
         return None
     return db.collection("groups").document(str(group_id)).collection("users").document(str(user_id))
 
+def get_filter_ref(group_id: int, keyword: str):
+    """Returns the Firestore document reference for a filter keyword in a group."""
+    if not db:
+        return None
+    # Use lowercase and stripped keyword for document ID for consistency
+    safe_keyword = keyword.strip().lower().replace(" ", "_")
+    return db.collection("groups").document(str(group_id)).collection("filters").document(safe_keyword)
+
 async def get_warn_count(group_id: int, user_id: int) -> int:
     """Fetches the current warning count for a user."""
     ref = get_user_ref(group_id, user_id)
@@ -91,6 +99,28 @@ async def update_warn_count(group_id: int, user_id: int, change: int):
     except Exception as e:
         logger.error(f"Error updating warn count: {e}")
         return current_warnings
+
+# --- Utility Commands ---
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message with bot information."""
+    await update.message.reply_text(
+        "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
+        "You can contact the owner through this bot. Just type your message—"
+        "\n\nThank you🦚"
+    )
+
+async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows the user ID of the sender or a replied user."""
+    if update.message.reply_to_message:
+        user = update.message.reply_to_message.from_user
+    else:
+        user = update.effective_user
+    
+    await update.message.reply_text(
+        f"The Telegram User ID for **{user.first_name}** is:\n`{user.id}`\n\nChat ID:\n`{update.effective_chat.id}`",
+        parse_mode="Markdown"
+    )
 
 # --- Group Management Commands (Admin/Owner Required) ---
 
@@ -278,19 +308,154 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"Could not unmute user. Error: {e}")
 
-# --- Utility Commands ---
+async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Promotes a replied user to administrator."""
+    if not await check_admin(update, context): return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Please reply to a user's message to promote them.")
+        return
 
-async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shows the user ID of the sender or a replied user."""
-    if update.message.reply_to_message:
-        user = update.message.reply_to_message.from_user
-    else:
-        user = update.effective_user
+    target_user = update.message.reply_to_message.from_user
+    group_id = update.effective_chat.id
+
+    try:
+        # Promote the user with no optional permissions granted by default (except basic ones)
+        await context.bot.promote_chat_member(
+            chat_id=group_id,
+            user_id=target_user.id,
+            can_manage_chat=True,
+            can_delete_messages=True,
+            can_restrict_members=True,
+            can_pin_messages=True,
+            can_promote_members=False, # Do not allow them to promote others initially
+            can_change_info=False
+        )
+        await update.message.reply_text(
+            f"👑 User {target_user.mention_html()} has been **PROMOTED** to a standard administrator.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Could not promote user. Make sure the bot is the group creator or has the 'Add New Admins' permission. Error: {e}")
+
+# --- Filter Management Commands ---
+
+async def set_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Assigns a filter keyword to a replied message (text, sticker, or photo)."""
+    if not await check_admin(update, context): return
     
-    await update.message.reply_text(
-        f"The Telegram User ID for **{user.first_name}** is:\n`{user.id}`\n\nChat ID:\n`{update.effective_chat.id}`",
-        parse_mode="Markdown"
-    )
+    reply = update.message.reply_to_message
+    if not reply:
+        await update.message.reply_text("Please reply to the message (text, sticker, or image) you want to filter and provide a keyword. Usage: `/filter <keyword>`")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("You must provide a keyword for the filter. Usage: `/filter <keyword>`")
+        return
+
+    keyword = context.args[0]
+    group_id = update.effective_chat.id
+    ref = get_filter_ref(group_id, keyword)
+    if not ref: return
+    
+    filter_data = {"keyword": keyword}
+
+    if reply.text:
+        filter_data.update({
+            "type": "text",
+            "content": reply.text
+        })
+    elif reply.sticker:
+        filter_data.update({
+            "type": "sticker",
+            "file_id": reply.sticker.file_id
+        })
+    elif reply.photo:
+        # Get the highest resolution photo file_id
+        filter_data.update({
+            "type": "photo",
+            "file_id": reply.photo[-1].file_id 
+        })
+    else:
+        await update.message.reply_text("Unsupported message type. Only text, stickers, and photos can be set as filters.")
+        return
+
+    try:
+        ref.set(filter_data)
+        await update.message.reply_text(
+            f"✅ Filter **'{keyword.lower()}'** set! When this word is used, I will reply with the saved {filter_data['type']}.", 
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error setting filter: {e}")
+        await update.message.reply_text(f"Failed to set filter due to a database error. Error: {e}")
+
+async def stop_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stops (deletes) a filter by keyword."""
+    if not await check_admin(update, context): return
+    
+    if not context.args:
+        await update.message.reply_text("You must provide the keyword of the filter to stop. Usage: `/stop <keyword>`")
+        return
+
+    keyword = context.args[0]
+    group_id = update.effective_chat.id
+    ref = get_filter_ref(group_id, keyword)
+    if not ref: return
+
+    try:
+        # Check if the filter exists before deleting
+        if ref.get().exists:
+            ref.delete()
+            await update.message.reply_text(
+                f"🛑 Filter **'{keyword.lower()}'** has been stopped and deleted.", 
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"Filter **'{keyword.lower()}'** not found.", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error deleting filter: {e}")
+        await update.message.reply_text(f"Failed to stop filter due to a database error. Error: {e}")
+
+async def handle_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks incoming messages against active filters and sends the corresponding content."""
+    if not db or not update.message.text:
+        return
+        
+    group_id = update.effective_chat.id
+    # Ensure checking against the raw text, not just the command-stripped text
+    message_text = update.message.text.lower()
+
+    # Get the reference to the filters collection for this group
+    filters_collection_ref = db.collection("groups").document(str(group_id)).collection("filters")
+
+    try:
+        # Fetch all filter documents
+        filters_snapshot = filters_collection_ref.stream()
+        
+        for doc in filters_snapshot:
+            filter_data = doc.to_dict()
+            keyword = filter_data.get("keyword", "").lower()
+
+            # Check if the keyword is present in the message text
+            if keyword and keyword in message_text:
+                filter_type = filter_data.get("type")
+                file_id = filter_data.get("file_id")
+                content = filter_data.get("content")
+                
+                # Reply to the user's message with the filtered content
+                if filter_type == "text" and content:
+                    await update.message.reply_text(content)
+                elif filter_type == "sticker" and file_id:
+                    await update.message.reply_sticker(file_id)
+                elif filter_type == "photo" and file_id:
+                    await update.message.reply_photo(file_id)
+                
+                # Stop processing after the first matching filter is found
+                return
+
+    except Exception as e:
+        logger.error(f"Error checking/handling filters: {e}")
+
 
 # --- Owner-Only Commands ---
 
@@ -329,7 +494,9 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     # --- Register Handlers ---
+    
     # Public/Utility Commands
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("id", get_user_id))
 
     # Admin/Management Commands
@@ -340,9 +507,17 @@ def main() -> None:
     application.add_handler(CommandHandler("unban", unban_user))
     application.add_handler(CommandHandler("mute", mute_user))
     application.add_handler(CommandHandler("unmute", unmute_user))
+    application.add_handler(CommandHandler("promote", promote_user))
+    application.add_handler(CommandHandler("filter", set_filter))
+    application.add_handler(CommandHandler("stop", stop_filter))
+
 
     # Owner-Only Commands
     application.add_handler(CommandHandler("broadcast", broadcast_message))
+
+    # Message Handler for Filters (must run on TEXT messages that are NOT commands)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_filters))
+
 
     # --- Start Webhook (for Render/Cloud Hosting) ---
     logger.info(f"Starting webhook on port {PORT}...")
