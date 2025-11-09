@@ -118,7 +118,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Sends a welcome message with bot information and tracks the chat for broadcasting."""
     await update.message.reply_text(
         "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
-        "You can manage a group chat using this bot. Always adding new features. Just try it—"
+        "you can manage a gc using this bot. Continuously workin to make it better. Just have a try—"
         "\n\nThank you🦚"
     )
 
@@ -269,25 +269,24 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
     
     # We start with the most permissive base setting, and then modify the target permission(s).
     # set_chat_permissions replaces the ENTIRE permission set.
+    # FIX: Removed 'can_send_stickers' and 'can_send_animations'. They are covered by 'can_send_other_messages'.
     permissions = ChatPermissions(
         can_send_messages=True, can_send_audios=True, can_send_documents=True,
         can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
         can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-        can_add_web_page_previews=True, can_send_stickers=True, can_send_animations=True
+        can_add_web_page_previews=True
     )
-    
-    # Map feature names to the ChatPermissions attributes
-    targets = []
     
     if feature_arg == "all":
         # Lock all means setting can_send_messages to False, which implicitly disables almost everything else.
-        # Unlock all means setting can_send_messages to True, which implicitly enables almost everything else.
         permissions.can_send_messages = not lock 
+        # Also explicitly restrict other messages (stickers/animations)
+        permissions.can_send_other_messages = not lock 
     elif feature_arg == "text":
         permissions.can_send_messages = not lock
     elif feature_arg == "stickers":
-        permissions.can_send_stickers = not lock
-        permissions.can_send_animations = not lock
+        # FIX: Stickers, animations (GIFs), and games are usually controlled by this flag
+        permissions.can_send_other_messages = not lock
     elif feature_arg == "media":
         # All media types
         permissions.can_send_photos = not lock
@@ -585,6 +584,7 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     try:
         # Give back all default permissions (unmute)
+        # FIX: Removed invalid ChatPermissions arguments like can_send_stickers, can_change_info, etc.
         await context.bot.restrict_chat_member(
             group_id,
             target_user.id,
@@ -597,12 +597,8 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 can_send_video_notes=True,
                 can_send_voice_notes=True,
                 can_send_polls=True,
-                can_send_other_messages=True,
+                can_send_other_messages=True, # Covers stickers, animations, games
                 can_add_web_page_previews=True,
-                can_change_info=False,
-                can_invite_users=True,
-                can_pin_messages=False,
-                can_manage_topics=False
             )
         )
         await update.message.reply_text(
