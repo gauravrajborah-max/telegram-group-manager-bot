@@ -1,5 +1,6 @@
 import os
 import logging
+import re # Added for link detection fallback (though message entities are better)
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta, timezone
@@ -58,15 +59,20 @@ async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     if is_owner(user_id):
         return True
 
-    member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-    if member.status in ["creator", "administrator"]:
-        return True
-    
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
+        if member.status in ["creator", "administrator"]:
+            return True
+    except Exception as e:
+        logger.error(f"Failed to check admin status: {e}")
+        await update.message.reply_text("Could not verify admin status. Ensure the bot is an admin.")
+        return False
+
     await update.message.reply_text("You must be an administrator or the bot owner to use this command.")
     return False
 
 def get_user_ref(group_id: int, user_id: int):
-    """Returns the Firestore document reference for a user in a group."""
+    """Returns the Firestore document reference for a user in a group (for warnings)."""
     if not db:
         return None
     return db.collection("groups").document(str(group_id)).collection("users").document(str(user_id))
@@ -86,6 +92,24 @@ def get_banned_word_ref(group_id: int, word: str):
     safe_word = word.strip().lower().replace(" ", "_")
     # Using a subcollection named 'banned_words' inside the group document
     return db.collection("groups").document(str(group_id)).collection("banned_words").document(safe_word)
+
+def get_link_approval_ref(group_id: int, user_id: int):
+    """Returns the Firestore document reference for a user's link approval status."""
+    if not db:
+        return None
+    # New collection for link approvals: groups/{group_id}/approved_link_users/{user_id}
+    return db.collection("groups").document(str(group_id)).collection("approved_link_users").document(str(user_id))
+
+async def is_link_approved(group_id: int, user_id: int) -> bool:
+    """Checks if a user is approved to send links."""
+    ref = get_link_approval_ref(group_id, user_id)
+    if not ref: return False
+    try:
+        doc = ref.get()
+        return doc.exists
+    except Exception as e:
+        logger.error(f"Error checking link approval: {e}")
+        return False
 
 async def get_warn_count(group_id: int, user_id: int) -> int:
     """Fetches the current warning count for a user."""
@@ -118,7 +142,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Sends a welcome message with bot information and tracks the chat for broadcasting."""
     await update.message.reply_text(
         "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
-        "You can manage a gc with this bot. Just give it the admin rights and you're good to go🐦—"
+        "You can contact the owner through this bot. You can also manage a gc with this bot. Just give it the admin rights and you're good to go🐣——"
         "\n\nThank you🦚"
     )
 
@@ -153,7 +177,43 @@ async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown"
     )
 
-# --- Countdown Commands ---
+async def purge_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deletes all messages starting from the replied message up to the command itself."""
+    if not await check_admin(update, context): return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Please reply to the message you want to start purging from.")
+        return
+
+    chat_id = update.effective_chat.id
+    from_id = update.message.reply_to_message.message_id
+    to_id = update.message.message_id
+    
+    deleted_count = 0
+    
+    # Iterate from the replied message ID up to the /purge command ID
+    # Note: Telegram message IDs are sequential within a chat.
+    for message_id in range(from_id, to_id + 1):
+        try:
+            await context.bot.delete_message(chat_id, message_id)
+            deleted_count += 1
+        except Exception as e:
+            # Errors can occur if a message in the range was already deleted or is a service message
+            logger.debug(f"Could not delete message {message_id}: {e}")
+            pass 
+
+    # Send a small, temporary confirmation (and delete it shortly after)
+    try:
+        confirmation_msg = await update.message.reply_text(
+            f"🗑️ Successfully purged **{deleted_count}** messages.",
+            parse_mode="Markdown"
+        )
+        # Delete the confirmation message after 5 seconds
+        await context.bot.delete_message(chat_id, confirmation_msg.message_id, timeout=5)
+    except Exception as e:
+        logger.warning(f"Failed to send or delete confirmation message: {e}")
+
+
+# --- Countdown Commands (Existing) ---
 
 async def set_countdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sets a group-wide countdown to a specific date."""
@@ -255,7 +315,7 @@ async def check_countdown(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error(f"Error checking countdown: {e}")
         await update.message.reply_text(f"An error occurred while checking the countdown: {e}")
 
-# --- Lock/Unlock Commands ---
+# --- Lock/Unlock Commands (Existing) ---
 
 async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE, lock: bool) -> None:
     """Handles /lock and /unlock commands for various features."""
@@ -266,8 +326,6 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     feature_arg = context.args[0].lower()
     group_id = update.effective_chat.id
-    
-    # --- New Logic: Use a dictionary to hold the new permissions based on lock status ---
     
     # Start with all permissions enabled (as a fallback/default)
     new_perms = {
@@ -288,8 +346,7 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
         current_chat = await context.bot.get_chat(group_id)
         # Use the current chat permissions as the baseline if available
         if current_chat.permissions:
-             # NOTE: If any of these properties are None (e.g., if Telegram hasn't set them explicitly), 
-             # we default to True, assuming default group member permissions are permissive.
+             # NOTE: If any of these properties are None, we default to True
              new_perms = {
                 "can_send_messages": current_chat.permissions.can_send_messages if current_chat.permissions.can_send_messages is not None else True,
                 "can_send_audios": current_chat.permissions.can_send_audios if current_chat.permissions.can_send_audios is not None else True,
@@ -304,7 +361,6 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
             }
     except Exception as e:
         logger.warning(f"Could not fetch current chat permissions, defaulting to all True: {e}")
-        # If fetching fails, we keep the permissive default `new_perms` defined above.
 
 
     # Determine the target value (False for lock, True for unlock)
@@ -370,7 +426,7 @@ async def unlock_feature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Unlocks a specific feature."""
     await handle_lock_unlock(update, context, False)
 
-# --- Banned Word Commands ---
+# --- Banned Word Commands (Existing) ---
 
 async def ban_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bans a word from the group and stores it in Firestore."""
@@ -430,30 +486,20 @@ async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Do not check/delete messages from admins or owner
     try:
-        # Check admin status without reply, as this is a message handler
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-
-        is_user_admin = False
-        if is_owner(user_id):
-            is_user_admin = True
-        elif update.effective_chat.type in ["group", "supergroup", "channel"]:
-            member = await context.bot.get_chat_member(chat_id, user_id)
-            if member.status in ["creator", "administrator"]:
-                is_user_admin = True
-
-        if is_user_admin:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status in ["creator", "administrator"] or is_owner(user_id):
             return
             
     except Exception as e:
-        logger.warning(f"Failed to check admin status in handle_banned_words: {e}")
-        # Continue execution, better safe than sorry
+        # If we can't check admin status (e.g. private chat or error), we proceed to check words
+        logger.debug(f"Failed to check admin status in handle_banned_words: {e}")
 
     message = update.message
     message_text = message.text.lower()
     group_id = update.effective_chat.id
 
-    # The banned words are stored in a subcollection under the group document
     banned_words_ref = db.collection("groups").document(str(group_id)).collection("banned_words")
     
     try:
@@ -462,13 +508,9 @@ async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
         for doc in banned_words_snapshot:
             word = doc.to_dict().get("word", "")
             
-            # Check for banned word existence in the message
             if word and word in message_text:
-                # Delete the message
                 try:
                     await message.delete()
-                    
-                    # Notify the user (using the group chat_id)
                     await context.bot.send_message(
                         chat_id=group_id,
                         text=f"⚠️ {message.from_user.mention_html()}, your message was deleted for using a banned word: **{word}**.",
@@ -476,14 +518,136 @@ async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
                     )
                 except Exception as e:
                     logger.warning(f"Failed to delete banned word message or send warning: {e}")
-                    # If deletion fails (bot lacks permission), just log and move on.
-                return # Stop checking after the first match
+                return 
                 
     except Exception as e:
         logger.error(f"Error handling banned words: {e}")
 
 
-# --- Group Management Commands (Admin/Owner Required) ---
+# --- Link Approval Commands (NEW) ---
+
+async def approve_link_sender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approves a replied member to send links in the group."""
+    if not await check_admin(update, context): return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Please reply to a user's message to approve them for sending links.")
+        return
+    if not db:
+        await update.message.reply_text("Database not available.")
+        return
+
+    target_user = update.message.reply_to_message.from_user
+    group_id = update.effective_chat.id
+    ref = get_link_approval_ref(group_id, target_user.id)
+
+    try:
+        ref.set({
+            "user_id": target_user.id, 
+            "username": target_user.username,
+            "full_name": target_user.full_name,
+            "timestamp": firestore.SERVER_TIMESTAMP
+        })
+        await update.message.reply_text(
+            f"✅ User {target_user.mention_html()} has been **APPROVED** to send external links.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Error approving link sender: {e}")
+        await update.message.reply_text(f"Failed to approve link sender due to a database error: {e}")
+
+async def disapprove_link_sender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disapproves a replied member from sending links in the group."""
+    if not await check_admin(update, context): return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Please reply to a user's message to disapprove them for sending links.")
+        return
+    if not db:
+        await update.message.reply_text("Database not available.")
+        return
+
+    target_user = update.message.reply_to_message.from_user
+    group_id = update.effective_chat.id
+    ref = get_link_approval_ref(group_id, target_user.id)
+
+    try:
+        if ref.get().exists:
+            ref.delete()
+            await update.message.reply_text(
+                f"🛑 User {target_user.mention_html()} has been **DISAPPROVED** from sending external links.",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(f"User {target_user.mention_html()} was not found in the approved list.", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error disapproving link sender: {e}")
+        await update.message.reply_text(f"Failed to disapprove link sender due to a database error: {e}")
+
+async def handle_link_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checks for links and deletes the message, warning the user if they are not approved."""
+    if not db or update.effective_chat.type not in ["group", "supergroup"]:
+        return
+
+    message = update.message
+    group_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    target_user = update.effective_user
+    
+    # 1. Check if the message contains an actual link entity or a text mention/link
+    # filters.Entity("url") already ensures we only process messages with links, 
+    # but we double check here to be safe and ensure it's not a service message.
+    if not message.entities and not message.caption_entities:
+        return
+    
+    # Check if the user is an admin or owner (they are always allowed to post links)
+    try:
+        member = await context.bot.get_chat_member(group_id, user_id)
+        if member.status in ["creator", "administrator"] or is_owner(user_id):
+            return
+    except Exception as e:
+        logger.warning(f"Error checking admin status for link handler: {e}")
+        # If we fail to check status, we treat them as a normal user for moderation purposes
+
+    # 2. Check link approval status from Firestore
+    if await is_link_approved(group_id, user_id):
+        # User is approved, do nothing
+        return
+
+    # 3. User is NOT approved and posted a link -> Moderate action
+    try:
+        # Delete the link message
+        await message.delete()
+        
+        # Apply warning logic (similar to /warn command)
+        new_warnings = await update_warn_count(group_id, user_id, 1)
+        
+        reason = "Unapproved external link detected."
+
+        if new_warnings >= 3:
+            # Ban the user on 3rd warning
+            try:
+                await context.bot.ban_chat_member(group_id, target_user.id)
+                await update_warn_count(group_id, target_user.id, -new_warnings) # Reset warnings
+                await context.bot.send_message(
+                    chat_id=group_id,
+                    text=f"🚨 User {target_user.mention_html()} reached 3 warnings and has been **BANNED** for posting unapproved links.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Failed to ban user after 3 link warnings: {e}")
+                
+        else:
+            # Send warning message
+            await context.bot.send_message(
+                chat_id=group_id,
+                text=f"⚠️ User {target_user.mention_html()}! Your message was deleted due to an **unapproved link** (Warning {new_warnings}/3).",
+                parse_mode="HTML"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error handling unapproved link message: {e}")
+
+
+# --- Group Management Commands (Existing) ---
 
 async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Warns a user and tracks the count. Kicks/bans on reaching 3 warnings."""
@@ -696,7 +860,7 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         await update.message.reply_text(f"Could not promote user. Make sure the bot is the group creator or has the 'Add New Admins' permission. Error: {e}")
 
-# --- Filter Management Commands ---
+# --- Filter Management Commands (Existing) ---
 
 async def set_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Assigns a filter keyword to a replied message (text, sticker, or photo)."""
@@ -812,7 +976,7 @@ async def handle_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error(f"Error checking/handling filters: {e}")
 
-# --- Owner-Only Commands ---
+# --- Owner-Only Commands (Existing) ---
 
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only command to broadcast a message to all tracked chats."""
@@ -830,8 +994,6 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # Extract the message content (skipping the /broadcast command and the space)
-    # update.message.text is like "/broadcast Hello world!", args are ["Hello", "world!"]
-    # We join the args back into a single string.
     message_to_send = update.message.text.split(" ", 1)[1]
     
     # 1. Fetch all chat IDs from the 'broadcast_chats' collection
@@ -895,10 +1057,15 @@ def main() -> None:
     # Public/Utility Commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("id", get_user_id))
+    application.add_handler(CommandHandler("purge", purge_messages)) # NEW
 
     # Countdown Commands
     application.add_handler(CommandHandler("set_countdown", set_countdown))
     application.add_handler(CommandHandler("check_countdown", check_countdown))
+
+    # Link Approval Commands (NEW)
+    application.add_handler(CommandHandler("approve", approve_link_sender))
+    application.add_handler(CommandHandler("disapprove", disapprove_link_sender))
 
     # Admin/Management Commands
     application.add_handler(CommandHandler("warn", warn_user))
@@ -920,12 +1087,19 @@ def main() -> None:
     application.add_handler(CommandHandler("ban_word", ban_word))
     application.add_handler(CommandHandler("unban_word", unban_word))
 
-    # Owner-Only Commands (FIXED: broadcast_message is now defined)
+    # Owner-Only Commands
     application.add_handler(CommandHandler("broadcast", broadcast_message))
 
-    # Message Handlers (must run on TEXT messages that are NOT commands)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_filters))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_banned_words))
+    # Message Handlers
+    # 1. Link Handler (MUST RUN BEFORE handle_filters or handle_banned_words to prioritize link moderation)
+    # Checks for entities that represent links (URLs, text links, or user mentions which can be links)
+    link_filters = filters.Entity("url") | filters.Entity("text_link") | filters.Entity("text_mention")
+    application.add_handler(MessageHandler(link_filters, handle_link_messages)) # NEW
+    
+    # 2. Filter and Banned Word Handlers (only run on TEXT messages that are NOT commands)
+    text_filters = filters.TEXT & ~filters.COMMAND
+    application.add_handler(MessageHandler(text_filters, handle_filters))
+    application.add_handler(MessageHandler(text_filters, handle_banned_words))
 
 
     # --- Start Webhook (for Render/Cloud Hosting) ---
