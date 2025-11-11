@@ -22,8 +22,8 @@ PORT = int(os.environ.get("PORT", 8080))
 
 # Gemini Configuration (Updated for Gemini 2.5 Flash)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # Use this environment variable now
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
+GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # 2. Logging Setup
 logging.basicConfig(
