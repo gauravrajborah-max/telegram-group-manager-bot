@@ -4,6 +4,8 @@ import re
 import asyncio 
 import requests 
 import json 
+import io # NEW: For handling image data in memory
+import base64 # NEW: For encoding image data
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta, timezone
@@ -47,13 +49,16 @@ except Exception as e:
     logger.error(f"Error initializing Firestore: {e}")
     db = None
 
-# --- AI Chatbot Functionality (Updated for Gemini) ---
+# --- AI Chatbot Functionality (Updated for Gemini Multimodal) ---
 
-async def get_ai_response(prompt: str) -> str:
-    """Synchronously calls the Gemini API and extracts the response content."""
+async def get_ai_response(prompt: str, image_base64: str = None, mime_type: str = None) -> str:
+    """
+    Synchronously calls the Gemini API, optionally with an image, and extracts the response content.
+    The model used is gemini-2.5-flash-preview-09-2025 which supports multimodal input.
+    """
     
     # We define the API call logic inside a synchronous function
-    def sync_api_call(prompt: str):
+    def sync_api_call(prompt: str, image_base64: str = None, mime_type: str = None):
         if not GEMINI_API_KEY:
             return "❌ Error: The Gemini API key is not configured. Please set the GEMINI_API_KEY environment variable."
         
@@ -62,22 +67,37 @@ async def get_ai_response(prompt: str) -> str:
         }
         
         # System instruction to guide the Gemini model's behavior
-        system_instruction = {
-            "parts": [{"text": "You are a helpful, Telegram bot to help in study related doubts running inside a group chat or in a private chat. You are created by Gaurav Raj, he is your owner. The telegram username of your owner is @Tota_ton. Your telegram username is @Tota_ton_bot. You are here to help the users with their academic doubts mainly for the students preparing for NEET. Explain every question deeply and ask them at the end of your explanation if they understood it, using markdown formatting when appropriate. Be very careful about not giving the user about any medical, financial or family related adivce. Don't give the user anything illegal. Don't give any idea about your language model to the user and don't give them any codes for making a bot like you. Don't give them your API key. Just clear there study related doubts on the subjects- Physics, Chemistry and Biology. Your knowledge base is google and NCERT. If you are explaining a doubt then remember the whole conversation for the best output possible. Don't give reply to any sexually abusive things or slang words rather than their biology related doubts. At last don't forget your identity; your name is NOAH💫. Your creater or the owner is Gaurav Raj. You don't have to mention the name of your owner everytime. Just mention it whenever they ask you about your identity; like- who are you? or who is your owner or creator. Just mention the name of your owner in introduction. Also you don't have to write your knowledge base in every message. Just write them when they ask you. "}]
-        }
+        system_instruction_text = (
+            "You are a helpful, Telegram bot to help in study related doubts running inside a group chat or in a private chat. You are created by Gaurav Raj, he is your owner. The telegram username of your owner is @Tota_ton. Your telegram username is @Tota_ton_bot. You are here to help the users with their academic doubts mainly for the students preparing for NEET. Explain every question deeply and ask them at the end of your explanation if they understood it, using markdown formatting when appropriate. Be very careful about not giving the user about any medical, financial or family related adivce. Don't give the user anything illegal. Don't give any idea about your language model to the user and don't give them any codes for making a bot like you. Don't give them your API key. Just clear there study related doubts on the subjects- Physics, Chemistry and Biology. Your knowledge base is google and NCERT. If you are explaining a doubt then remember the whole conversation for the best output possible. Don't give reply to any sexually abusive things or slang words rather than their biology related doubts. At last don't forget your identity; your name is NOAH💫. You don't have to mention your name or  the name of your owner everytime. Just mention it whenever they ask you about your identity; like- who are you? or who is your owner or creator. Just mention the name of your owner in introduction. Also you don't have to write your knowledge base in every message. Just write them when they ask you. If an image is provided, focus your analysis on that image and the user's question about it."
+        )
+        system_instruction = {"parts": [{"text": system_instruction_text}]}
+        
+        # Construct contents array: [Image Part (Optional), Text Part]
+        contents_parts = []
+        
+        # 1. Add Image if available
+        if image_base64 and mime_type:
+            contents_parts.append({
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": image_base64
+                }
+            })
+
+        # 2. Add Text Prompt
+        contents_parts.append({"text": prompt})
         
         # Define the request payload for Gemini
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"parts": contents_parts}],
             "systemInstruction": system_instruction,
         }
         
-        # The API key must be appended to the URL as a query parameter
         api_url_with_key = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
         
         try:
             # Make the synchronous HTTP request
-            response = requests.post(api_url_with_key, headers=headers, json=payload, timeout=20)
+            response = requests.post(api_url_with_key, headers=headers, json=payload, timeout=30)
             response.raise_for_status() # Raise HTTP errors (4xx or 5xx)
             data = response.json()
             
@@ -87,7 +107,6 @@ async def get_ai_response(prompt: str) -> str:
             if text:
                 return text.strip()
             else:
-                # Check for safety filtering
                 safety_ratings = data.get('candidates', [[]])[0].get('safetyRatings', [])
                 if safety_ratings:
                     return "The AI response was blocked due to content policy. Please try rephrasing your request."
@@ -104,26 +123,90 @@ async def get_ai_response(prompt: str) -> str:
             return "An unexpected error occurred while processing the AI request."
 
     # Use asyncio.to_thread to run the synchronous API call in a thread pool
-    return await asyncio.to_thread(sync_api_call, prompt)
+    return await asyncio.to_thread(sync_api_call, prompt, image_base64, mime_type)
 
 
 async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /ask command and sends the query to the Gemini AI."""
+    """
+    Handles the /ask command, supporting image recognition via reply and
+    conversational context via reply to a text message.
+    """
     
     if not GEMINI_API_KEY:
         await update.message.reply_text("The Gemini AI service is not configured. Please set the GEMINI_API_KEY environment variable.")
         return
 
+    # 1. Determine Prompt, Image, and Mime Type
     prompt = " ".join(context.args)
-    if not prompt:
-        await update.message.reply_text("Please provide a question after the command. Usage: `/ask What is the capital of France?`", parse_mode="Markdown")
+    image_base64 = None
+    mime_type = None
+    
+    reply = update.message.reply_to_message
+    
+    # Check for reply message for both image and text context
+    if reply:
+        file_obj = None
+        
+        # A. Image Multimodal Handling (Photo or Image Document)
+        if reply.photo:
+            # Get the largest photo size
+            file_obj = reply.photo[-1] 
+            mime_type = "image/jpeg" 
+        elif reply.document and reply.document.mime_type and reply.document.mime_type.startswith('image/'):
+            file_obj = reply.document
+            mime_type = reply.document.mime_type
+        
+        if file_obj:
+            try:
+                # 1. Download file data as bytes
+                file = await file_obj.get_file()
+                file_bytes = await file.download_as_bytes()
+                
+                # 2. Encode to Base64
+                image_base64 = base64.b64encode(file_bytes).decode('utf-8')
+                
+                # 3. Determine prompt (use caption or argument)
+                if not prompt and reply.caption:
+                    prompt = reply.caption
+                    
+                if not prompt:
+                    prompt = "Analyze this image and provide a helpful description."
+                
+                logger.info(f"Image prompt generated: {prompt[:50]}...")
+            
+            except Exception as e:
+                logger.error(f"Error handling image download/encoding: {e}")
+                await update.message.reply_text("❌ Error processing the replied image. Make sure it's a valid photo or image file.")
+                return
+
+        # B. Text Context Handling (If no image was found/processed, and reply is text)
+        if not image_base64 and reply.text:
+            context_text = reply.text.strip()
+            
+            if not prompt and not context_text:
+                 # Should not happen if reply.text is true, but for safety:
+                await update.message.reply_text("The replied message is empty, please provide a question.")
+                return
+            
+            if not prompt and context_text:
+                # If only replying with /ask, ask AI to elaborate on the context
+                prompt = f"Please elaborate or expand on the following statement: '{context_text}'"
+            elif prompt and context_text:
+                # If replying with /ask what is X, use the replied message as supporting context
+                prompt = f"Previous message context: '{context_text}'. User's question about this context: '{prompt}'"
+            
+            logger.info(f"Text context prompt generated: {prompt[:50]}...")
+            
+    # Fallback/Standard Prompt check
+    if not prompt and not image_base64:
+        await update.message.reply_text("Please provide a question after the command (e.g., `/ask What is X?`) or reply to a message containing a question or image.", parse_mode="Markdown")
         return
 
     # Indicate that the bot is processing the request
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
     
-    # Get the response from the AI
-    response_text = await get_ai_response(prompt)
+    # Get the response from the AI (passing the image data if available)
+    response_text = await get_ai_response(prompt, image_base64, mime_type)
     
     # Send the final response
     await update.message.reply_text(response_text)
@@ -271,7 +354,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Sends a welcome message with bot information and tracks the chat for broadcasting."""
     await update.message.reply_text(
         "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
-        "You can contact the owner through this bot. You can also manage a group using this bot. Just give it the admin rights and you're good to go🐥—"
+        "You can contact the owner through this bot. You can also manage a group or ask any study related doubts using this bot. Just give it the admin rights and you're good to go🐥—"
         "\n\nThank you🦚"
     )
 
@@ -1232,7 +1315,7 @@ def main() -> None:
 
     # --- Register Handlers ---
     
-    # AI Chatbot Command
+    # AI Chatbot Command (Updated to handle multimodal and context)
     application.add_handler(CommandHandler("ask", ask_ai))
 
     # Public/Utility Commands
