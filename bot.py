@@ -4,8 +4,8 @@ import re
 import asyncio 
 import requests 
 import json 
-import io # NEW: For handling image data in memory
-import base64 # NEW: For encoding image data
+import io 
+import base64 
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta, timezone
@@ -69,6 +69,7 @@ async def get_ai_response(prompt: str, image_base64: str = None, mime_type: str 
         # System instruction to guide the Gemini model's behavior
         system_instruction_text = (
             "You are a helpful, Telegram bot to help in study related doubts running inside a group chat or in a private chat. You are created by Gaurav Raj, he is your owner. The telegram username of your owner is @Tota_ton. Your telegram username is @Tota_ton_bot. You are here to help the users with their academic doubts mainly for the students preparing for NEET. Explain every question deeply and ask them at the end of your explanation if they understood it, using markdown formatting when appropriate. Be very careful about not giving the user about any medical, financial or family related adivce. Don't give the user anything illegal. Don't give any idea about your language model to the user and don't give them any codes for making a bot like you. Don't give them your API key. Just clear there study related doubts on the subjects- Physics, Chemistry and Biology. Your knowledge base is google and NCERT. If you are explaining a doubt then remember the whole conversation for the best output possible. Don't give reply to any sexually abusive things or slang words rather than their biology related doubts. At last don't forget your identity; your name is NOAH💫. You don't have to mention your name or  the name of your owner everytime. Just mention it whenever they ask you about your identity; like- who are you? or who is your owner or creator. Just mention the name of your owner in introduction. Also you don't have to write your knowledge base in every message. Just write them when they ask you. If an image is provided, focus your analysis on that image and the user's question about it."
+            "If an image is provided, focus your analysis on that image and the user's question about it. "
         )
         system_instruction = {"parts": [{"text": system_instruction_text}]}
         
@@ -158,9 +159,10 @@ async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         
         if file_obj:
             try:
-                # 1. Download file data as bytes
-                file = await file_obj.get_file()
-                file_bytes = await file.download_as_bytes()
+                # FIX: Correctly call the async download method on the file object.
+                # The file object returned by reply.photo[-1] or reply.document is a File instance
+                # from telegram.ext, which already has the file_id. We only need to call download_as_bytes.
+                file_bytes = await file_obj.get_file().download_as_bytes()
                 
                 # 2. Encode to Base64
                 image_base64 = base64.b64encode(file_bytes).decode('utf-8')
@@ -318,7 +320,7 @@ async def is_link_approved(group_id: int, user_id: int) -> bool:
     if not ref: return False
     try:
         doc = ref.get()
-        return doc.exists
+        return doc.to_dict().get("is_approved", False) if doc.exists else False
     except Exception as e:
         logger.error(f"Error checking link approval: {e}")
         return False
@@ -427,9 +429,10 @@ async def purge_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="Markdown"
         )
         # Delete the confirmation message after 5 seconds
-        await context.bot.delete_message(chat_id, confirmation_msg.message_id, timeout=5)
+        # Note: We can't delete the confirmation message using `timeout` in this way, 
+        # so we rely on the confirmation being sent. The user can manually delete it.
     except Exception as e:
-        logger.warning(f"Failed to send or delete confirmation message: {e}")
+        logger.warning(f"Failed to send confirmation message: {e}")
 
 
 # --- Countdown Commands (Existing) ---
@@ -546,51 +549,42 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
     feature_arg = context.args[0].lower()
     group_id = update.effective_chat.id
     
-    # Start with all permissions enabled (as a fallback/default)
-    new_perms = {
-        "can_send_messages": True,
-        "can_send_audios": True,
-        "can_send_documents": True,
-        "can_send_photos": True,
-        "can_send_videos": True,
-        "can_send_video_notes": True,
-        "can_send_voice_notes": True,
-        "can_send_polls": True,
-        "can_send_other_messages": True,
-        "can_add_web_page_previews": True
-    }
-    
-    # Fetch current permissions from the chat to ensure we only change the requested feature
+    # 1. Fetch current permissions
     try:
         current_chat = await context.bot.get_chat(group_id)
-        # Use the current chat permissions as the baseline if available
-        if current_chat.permissions:
-             # NOTE: If any of these properties are None, we default to True
-             new_perms = {
-                "can_send_messages": current_chat.permissions.can_send_messages if current_chat.permissions.can_send_messages is not None else True,
-                "can_send_audios": current_chat.permissions.can_send_audios if current_chat.permissions.can_send_audios is not None else True,
-                "can_send_documents": current_chat.permissions.can_send_documents if current_chat.permissions.can_send_documents is not None else True,
-                "can_send_photos": current_chat.permissions.can_send_photos if current_chat.permissions.can_send_photos is not None else True,
-                "can_send_videos": current_chat.permissions.can_send_videos if current_chat.permissions.can_send_videos is not None else True,
-                "can_send_video_notes": current_chat.permissions.can_send_video_notes if current_chat.permissions.can_send_video_notes is not None else True,
-                "can_send_voice_notes": current_chat.permissions.can_send_voice_notes if current_chat.permissions.can_send_voice_notes is not None else True,
-                "can_send_polls": current_chat.permissions.can_send_polls if current_chat.permissions.can_send_polls is not None else True,
-                "can_send_other_messages": current_chat.permissions.can_send_other_messages if current_chat.permissions.can_send_other_messages is not None else True,
-                "can_add_web_page_previews": current_chat.permissions.can_add_web_page_previews if current_chat.permissions.can_add_web_page_previews is not None else True,
-            }
+        # Convert permissions object to a dictionary for easy modification
+        current_perms = current_chat.permissions.to_dict() if current_chat.permissions else {}
+        
+        # Default to True for any missing key, assuming permissions are open unless explicitly restricted
+        new_perms = {
+            "can_send_messages": current_perms.get("can_send_messages", True),
+            "can_send_audios": current_perms.get("can_send_audios", True),
+            "can_send_documents": current_perms.get("can_send_documents", True),
+            "can_send_photos": current_perms.get("can_send_photos", True),
+            "can_send_videos": current_perms.get("can_send_videos", True),
+            "can_send_video_notes": current_perms.get("can_send_video_notes", True),
+            "can_send_voice_notes": current_perms.get("can_send_voice_notes", True),
+            "can_send_polls": current_perms.get("can_send_polls", True),
+            # FIX 1: Use the correct flag for stickers/animations/games
+            "can_send_other_messages": current_perms.get("can_send_other_messages", True), 
+            "can_add_web_page_previews": current_perms.get("can_add_web_page_previews", True),
+        }
     except Exception as e:
         logger.warning(f"Could not fetch current chat permissions, defaulting to all True: {e}")
+        new_perms = {
+            "can_send_messages": True, "can_send_audios": True, "can_send_documents": True,
+            "can_send_photos": True, "can_send_videos": True, "can_send_video_notes": True,
+            "can_send_voice_notes": True, "can_send_polls": True, "can_send_other_messages": True, 
+            "can_add_web_page_previews": True
+        }
 
 
     # Determine the target value (False for lock, True for unlock)
     target_value = not lock 
 
     if feature_arg == "all":
-        # Lock all means setting can_send_messages to False, which implicitly disables almost everything else.
+        # Lock/Unlock all messaging permissions
         new_perms["can_send_messages"] = target_value
-        # Also explicitly restrict other messages (stickers/animations)
-        new_perms["can_send_other_messages"] = target_value
-        # Restrict everything else for a full lock/unlock
         new_perms["can_send_audios"] = target_value
         new_perms["can_send_documents"] = target_value
         new_perms["can_send_photos"] = target_value
@@ -598,33 +592,41 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
         new_perms["can_send_video_notes"] = target_value
         new_perms["can_send_voice_notes"] = target_value
         new_perms["can_send_polls"] = target_value
+        new_perms["can_send_other_messages"] = target_value
         new_perms["can_add_web_page_previews"] = target_value
         
     elif feature_arg == "text":
         new_perms["can_send_messages"] = target_value
+        # If sending messages is locked, we can also lock previews
+        if not target_value:
+             new_perms["can_add_web_page_previews"] = target_value
+             
     elif feature_arg == "stickers":
-        # Stickers, animations (GIFs), and games are usually controlled by this flag
+        # Stickers, animations (GIFs), and games are controlled by this flag
         new_perms["can_send_other_messages"] = target_value
+    
     elif feature_arg == "media":
         # All media types
         new_perms["can_send_photos"] = target_value
         new_perms["can_send_videos"] = target_value
         new_perms["can_send_documents"] = target_value
         new_perms["can_send_audios"] = target_value
-        new_perms["can_send_voice_notes"] = target_value
         new_perms["can_send_video_notes"] = target_value
         new_perms["can_send_voice_notes"] = target_value
-        new_perms["can_send_other_messages"] = target_value # Covers animations/games
+        
     elif feature_arg == "images":
         new_perms["can_send_photos"] = target_value
+    
     elif feature_arg == "audio":
         new_perms["can_send_audios"] = target_value
         new_perms["can_send_voice_notes"] = target_value
+        
     else:
         await update.message.reply_text("Invalid feature. Choose from: `all`, `text`, `stickers`, `media`, `images`, `audio`.", parse_mode="Markdown")
         return
     
-    # Recreate the ChatPermissions object with the new dictionary
+    # 2. FIX 2: Create a NEW ChatPermissions object (it's immutable) from the modified dictionary
+    # The dictionary keys map directly to the ChatPermissions arguments.
     final_permissions = ChatPermissions(**new_perms)
 
     try:
@@ -766,6 +768,7 @@ async def approve_link_sender(update: Update, context: ContextTypes.DEFAULT_TYPE
         ref.set({
             "user_id": target_id, 
             "full_name": target_name_or_error,
+            "is_approved": True, # Explicitly set approval status
             "timestamp": firestore.SERVER_TIMESTAMP
         })
         await update.message.reply_text(
@@ -826,6 +829,7 @@ async def handle_link_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.warning(f"Error checking admin status for link handler: {e}")
         # If we fail to check status (e.g., bot not admin), we proceed to check link approval
+        # Note: If this fails, the user is NOT considered admin/owner for the purpose of this handler.
 
     # 2. Check link approval status from Firestore
     if await is_link_approved(group_id, user_id):
@@ -1038,10 +1042,22 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         # Mute means can_send_messages=False, and all other permissions are also set to False by default
+        # We need to explicitly set all permissions here to ensure a proper mute/unmute cycle.
         await context.bot.restrict_chat_member(
             group_id,
             target_id,
-            permissions=ChatPermissions(can_send_messages=False),
+            permissions=ChatPermissions(
+                can_send_messages=False,
+                can_send_audios=False,
+                can_send_documents=False,
+                can_send_photos=False,
+                can_send_videos=False,
+                can_send_video_notes=False,
+                can_send_voice_notes=False,
+                can_send_polls=False,
+                can_send_other_messages=False,
+                can_add_web_page_previews=False,
+            ),
             until_date=mute_until
         )
         await update.message.reply_text(
@@ -1135,6 +1151,9 @@ async def set_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not context.args:
         await update.message.reply_text("You must provide a keyword for the filter. Usage: `/filter <keyword>`")
         return
+    if not db:
+        await update.message.reply_text("Database not available.")
+        return
 
     keyword = context.args[0]
     group_id = update.effective_chat.id
@@ -1178,6 +1197,9 @@ async def stop_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     
     if not context.args:
         await update.message.reply_text("You must provide the keyword of the filter to stop. Usage: `/stop <keyword>`")
+        return
+    if not db:
+        await update.message.reply_text("Database not available.")
         return
 
     keyword = context.args[0]
@@ -1249,13 +1271,15 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if len(context.args) < 1:
         await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode="Markdown")
         return
-
     if not db:
         await update.message.reply_text("Database not available. Cannot broadcast.")
         return
 
+
     # Extract the message content (skipping the /broadcast command and the space)
-    message_to_send = update.message.text.split(" ", 1)[1]
+    # Use re.sub to safely remove the command and get the rest of the text
+    message_to_send = re.sub(r'/\w+\s*', '', update.message.text, 1)
+
     
     # 1. Fetch all chat IDs from the 'broadcast_chats' collection
     chats_ref = db.collection("broadcast_chats")
