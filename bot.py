@@ -1,6 +1,9 @@
 import os
 import logging
-import re # Added for link detection fallback (though message entities are better)
+import re
+import asyncio 
+import requests 
+import json 
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from datetime import datetime, timedelta, timezone
@@ -14,7 +17,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0)) # Your personal Telegram User ID
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 8080))
-# Firestore credentials will be loaded from a JSON string in an environment variable
+
+# Gemini Configuration (Updated for Gemini 2.5 Flash)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # Use this environment variable now
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
+GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 # 2. Logging Setup
 logging.basicConfig(
@@ -39,6 +46,88 @@ try:
 except Exception as e:
     logger.error(f"Error initializing Firestore: {e}")
     db = None
+
+# --- AI Chatbot Functionality (Updated for Gemini) ---
+
+async def get_ai_response(prompt: str) -> str:
+    """Synchronously calls the Gemini API and extracts the response content."""
+    
+    # We define the API call logic inside a synchronous function
+    def sync_api_call(prompt: str):
+        if not GEMINI_API_KEY:
+            return "❌ Error: The Gemini API key is not configured. Please set the GEMINI_API_KEY environment variable."
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        # System instruction to guide the Gemini model's behavior
+        system_instruction = {
+            "parts": [{"text": "You are a helpful, concise Telegram bot running inside a group chat. Keep your answers brief and relevant, using markdown formatting when appropriate."}]
+        }
+        
+        # Define the request payload for Gemini
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "systemInstruction": system_instruction,
+        }
+        
+        # The API key must be appended to the URL as a query parameter
+        api_url_with_key = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
+        
+        try:
+            # Make the synchronous HTTP request
+            response = requests.post(api_url_with_key, headers=headers, json=payload, timeout=20)
+            response.raise_for_status() # Raise HTTP errors (4xx or 5xx)
+            data = response.json()
+            
+            # Extract the content from the Gemini API response structure
+            text = data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text')
+            
+            if text:
+                return text.strip()
+            else:
+                # Check for safety filtering
+                safety_ratings = data.get('candidates', [[]])[0].get('safetyRatings', [])
+                if safety_ratings:
+                    return "The AI response was blocked due to content policy. Please try rephrasing your request."
+                return "The AI returned an empty or unrecognized response."
+
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Gemini HTTP Error: {e.response.status_code} - {e.response.text}")
+            return f"⚠️ Error ({e.response.status_code}): Failed to get a response from the AI. Check your API key or rate limits."
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Gemini Request Error: {e}")
+            return "⚠️ Error: Could not connect to the AI service. Please try again later."
+        except Exception as e:
+            logger.error(f"General AI Error: {e}")
+            return "An unexpected error occurred while processing the AI request."
+
+    # Use asyncio.to_thread to run the synchronous API call in a thread pool
+    return await asyncio.to_thread(sync_api_call, prompt)
+
+
+async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the /ask command and sends the query to the Gemini AI."""
+    
+    if not GEMINI_API_KEY:
+        await update.message.reply_text("The Gemini AI service is not configured. Please set the GEMINI_API_KEY environment variable.")
+        return
+
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text("Please provide a question after the command. Usage: `/ask What is the capital of France?`", parse_mode="Markdown")
+        return
+
+    # Indicate that the bot is processing the request
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    
+    # Get the response from the AI
+    response_text = await get_ai_response(prompt)
+    
+    # Send the final response
+    await update.message.reply_text(response_text)
+
 
 # --- Helper Functions (Checks and Database Interactions) ---
 
@@ -70,6 +159,46 @@ async def check_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
     await update.message.reply_text("You must be an administrator or the bot owner to use this command.")
     return False
+
+async def get_target_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int | None, str | None]:
+    """
+    Retrieves the target user's ID and name based on reply or command arguments (ID or @username).
+    Returns (user_id, full_name, or None, error_message).
+    """
+    # 1. Check for reply (Highest reliability)
+    if update.message.reply_to_message:
+        user = update.message.reply_to_message.from_user
+        return user.id, user.full_name
+
+    # 2. Check for argument (Username or ID)
+    if context.args and update.effective_chat.type in ["group", "supergroup"]:
+        target_str = context.args[0].strip()
+        chat_id = update.effective_chat.id
+        
+        # A. Attempt to parse as User ID
+        if target_str.isdigit():
+            user_id = int(target_str)
+            try:
+                # Try to fetch user info to get the name, but this can fail if they are not in the chat
+                member = await context.bot.get_chat_member(chat_id, user_id)
+                return user_id, member.user.full_name
+            except Exception:
+                # If fetching the name fails, we still have the ID
+                return user_id, f"User ID: {user_id}"
+            
+        # B. Attempt to parse as Username
+        elif target_str.startswith('@'):
+            username = target_str.lstrip('@')
+            try:
+                # Resolve username to ID using get_chat_member. This only works if the user 
+                # is currently a member of the group and has a public username set.
+                member = await context.bot.get_chat_member(chat_id, username)
+                return member.user.id, member.user.full_name
+            except Exception:
+                return None, f"⚠️ Error: Could not find user **@{username}** in this chat. Ensure they are a current member or use their User ID."
+
+    # 3. No target found
+    return None, "Please reply to a user's message, provide their Telegram User ID (e.g., `123456789`), or their username (e.g., `@username`)."
 
 def get_user_ref(group_id: int, user_id: int):
     """Returns the Firestore document reference for a user in a group (for warnings)."""
@@ -142,7 +271,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Sends a welcome message with bot information and tracks the chat for broadcasting."""
     await update.message.reply_text(
         "👋 This is a group moderation bot made with ♥ by @Tota_ton (Gaurav). "
-        "You can contact the owner through this bot. You can also manage a gc with this bot. Just give it the admin rights and you're good to go🐣——"
+        "You can contact the owner through this bot. You can also manage a group using this bot. Just give it the admin rights and you're good to go🐥—"
         "\n\nThank you🦚"
     )
 
@@ -167,15 +296,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shows the user ID of the sender or a replied user."""
-    if update.message.reply_to_message:
-        user = update.message.reply_to_message.from_user
-    else:
-        user = update.effective_user
     
-    await update.message.reply_text(
-        f"The Telegram User ID for **{user.first_name}** is:\n`{user.id}`\n\nChat ID:\n`{update.effective_chat.id}`",
-        parse_mode="Markdown"
-    )
+    # Use the new helper function to resolve the target
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if target_id:
+        user = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
+        await update.message.reply_text(
+            f"The Telegram User ID for **{target_name_or_error}** is:\n`{target_id}`\n\nChat ID:\n`{update.effective_chat.id}`",
+            parse_mode="Markdown"
+        )
+    else:
+        # If no user found via reply or arguments, show sender's ID
+        await update.message.reply_text(
+            f"The Telegram User ID for **{update.effective_user.first_name}** is:\n`{update.effective_user.id}`\n\nChat ID:\n`{update.effective_chat.id}`",
+            parse_mode="Markdown"
+        )
 
 async def purge_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Deletes all messages starting from the replied message up to the command itself."""
@@ -394,6 +530,7 @@ async def handle_lock_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE,
         new_perms["can_send_audios"] = target_value
         new_perms["can_send_voice_notes"] = target_value
         new_perms["can_send_video_notes"] = target_value
+        new_perms["can_send_voice_notes"] = target_value
         new_perms["can_send_other_messages"] = target_value # Covers animations/games
     elif feature_arg == "images":
         new_perms["can_send_photos"] = target_value
@@ -508,6 +645,7 @@ async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
         for doc in banned_words_snapshot:
             word = doc.to_dict().get("word", "")
             
+            # Using simple 'in' check for presence
             if word and word in message_text:
                 try:
                     await message.delete()
@@ -524,60 +662,61 @@ async def handle_banned_words(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Error handling banned words: {e}")
 
 
-# --- Link Approval Commands (NEW) ---
+# --- Link Approval Commands ---
 
 async def approve_link_sender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Approves a replied member to send links in the group."""
+    """Approves a replied/specified member to send links in the group."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to approve them for sending links.")
-        return
     if not db:
         await update.message.reply_text("Database not available.")
         return
 
-    target_user = update.message.reply_to_message.from_user
-    group_id = update.effective_chat.id
-    ref = get_link_approval_ref(group_id, target_user.id)
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
+        return
+
+    ref = get_link_approval_ref(update.effective_chat.id, target_id)
 
     try:
         ref.set({
-            "user_id": target_user.id, 
-            "username": target_user.username,
-            "full_name": target_user.full_name,
+            "user_id": target_id, 
+            "full_name": target_name_or_error,
             "timestamp": firestore.SERVER_TIMESTAMP
         })
         await update.message.reply_text(
-            f"✅ User {target_user.mention_html()} has been **APPROVED** to send external links.",
-            parse_mode="HTML"
+            f"✅ User **{target_name_or_error}** (ID: `{target_id}`) has been **APPROVED** to send external links.",
+            parse_mode="Markdown"
         )
     except Exception as e:
         logger.error(f"Error approving link sender: {e}")
         await update.message.reply_text(f"Failed to approve link sender due to a database error: {e}")
 
 async def disapprove_link_sender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Disapproves a replied member from sending links in the group."""
+    """Disapproves a replied/specified member from sending links in the group."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to disapprove them for sending links.")
-        return
     if not db:
         await update.message.reply_text("Database not available.")
         return
 
-    target_user = update.message.reply_to_message.from_user
-    group_id = update.effective_chat.id
-    ref = get_link_approval_ref(group_id, target_user.id)
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
+        return
+
+    ref = get_link_approval_ref(update.effective_chat.id, target_id)
 
     try:
         if ref.get().exists:
             ref.delete()
             await update.message.reply_text(
-                f"🛑 User {target_user.mention_html()} has been **DISAPPROVED** from sending external links.",
-                parse_mode="HTML"
+                f"🛑 User **{target_name_or_error}** (ID: `{target_id}`) has been **DISAPPROVED** from sending external links.",
+                parse_mode="Markdown"
             )
         else:
-            await update.message.reply_text(f"User {target_user.mention_html()} was not found in the approved list.", parse_mode="HTML")
+            await update.message.reply_text(f"User **{target_name_or_error}** was not found in the approved list.", parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Error disapproving link sender: {e}")
         await update.message.reply_text(f"Failed to disapprove link sender due to a database error: {e}")
@@ -593,8 +732,6 @@ async def handle_link_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     target_user = update.effective_user
     
     # 1. Check if the message contains an actual link entity or a text mention/link
-    # filters.Entity("url") already ensures we only process messages with links, 
-    # but we double check here to be safe and ensure it's not a service message.
     if not message.entities and not message.caption_entities:
         return
     
@@ -605,7 +742,7 @@ async def handle_link_messages(update: Update, context: ContextTypes.DEFAULT_TYP
             return
     except Exception as e:
         logger.warning(f"Error checking admin status for link handler: {e}")
-        # If we fail to check status, we treat them as a normal user for moderation purposes
+        # If we fail to check status (e.g., bot not admin), we proceed to check link approval
 
     # 2. Check link approval status from Firestore
     if await is_link_approved(group_id, user_id):
@@ -620,8 +757,6 @@ async def handle_link_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         # Apply warning logic (similar to /warn command)
         new_warnings = await update_warn_count(group_id, user_id, 1)
         
-        reason = "Unapproved external link detected."
-
         if new_warnings >= 3:
             # Ban the user on 3rd warning
             try:
@@ -647,95 +782,120 @@ async def handle_link_messages(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Error handling unapproved link message: {e}")
 
 
-# --- Group Management Commands (Existing) ---
+# --- Group Management Commands ---
 
 async def warn_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Warns a user and tracks the count. Kicks/bans on reaching 3 warnings."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to warn them.")
-        return
     
-    target_user = update.message.reply_to_message.from_user
+    # Resolve target user info
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
+        return
+
     group_id = update.effective_chat.id
 
-    if is_owner(target_user.id):
+    if is_owner(target_id):
         await update.message.reply_text("I cannot warn the owner.")
         return
 
-    new_warnings = await update_warn_count(group_id, target_user.id, 1)
+    new_warnings = await update_warn_count(group_id, target_id, 1)
     
-    reason = " ".join(context.args) if context.args else "No reason provided."
+    # Get reason, skipping the target user argument if it was provided
+    # Check if the first argument was used to identify the target
+    if context.args and target_name_or_error.startswith("User ID:") or (context.args and context.args[0].startswith('@')):
+        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided."
+    else:
+        # If the target was resolved by reply, the whole context.args is the reason
+        reason = " ".join(context.args) if context.args else "No reason provided."
+
 
     if new_warnings >= 3:
         try:
             # Ban the user
-            await context.bot.ban_chat_member(group_id, target_user.id)
-            await update_warn_count(group_id, target_user.id, -new_warnings) # Reset warnings
+            await context.bot.ban_chat_member(group_id, target_id)
+            await update_warn_count(group_id, target_id, -new_warnings) # Reset warnings
             await update.message.reply_text(
-                f"🚨 User {target_user.mention_html()} reached 3 warnings and has been **BANNED**.\nReason: {reason}",
-                parse_mode="HTML"
+                f"🚨 User **{target_name_or_error}** reached 3 warnings and has been **BANNED**.\nReason: {reason}",
+                parse_mode="Markdown"
             )
         except Exception as e:
             await update.message.reply_text(f"Could not ban user. Make sure the bot is an admin with 'ban users' permission. Error: {e}")
     else:
         await update.message.reply_text(
-            f"⚠️ User {target_user.mention_html()} has been **WARNED** (Warning {new_warnings}/3).\nReason: {reason}",
-            parse_mode="HTML"
+            f"⚠️ User **{target_name_or_error}** has been **WARNED** (Warning {new_warnings}/3).\nReason: {reason}",
+            parse_mode="Markdown"
         )
 
 async def remove_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Removes one warning from a user."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to remove a warning.")
+    
+    # Resolve target user info
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
         return
 
-    target_user = update.message.reply_to_message.from_user
     group_id = update.effective_chat.id
     
-    current_warnings = await get_warn_count(group_id, target_user.id)
+    current_warnings = await get_warn_count(group_id, target_id)
     if current_warnings > 0:
-        new_warnings = await update_warn_count(group_id, target_user.id, -1)
+        new_warnings = await update_warn_count(group_id, target_id, -1)
         await update.message.reply_text(
-            f"✅ Warning removed from {target_user.mention_html()}. Current warnings: {new_warnings}/3.",
-            parse_mode="HTML"
+            f"✅ Warning removed from **{target_name_or_error}**. Current warnings: {new_warnings}/3.",
+            parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text(f"User {target_user.mention_html()} has no active warnings to remove.", parse_mode="HTML")
+        await update.message.reply_text(f"User **{target_name_or_error}** has no active warnings to remove.", parse_mode="Markdown")
 
 async def warn_counts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shows the warning count of a user."""
-    # This command is often visible to all, but we will make it admin only for consistency
     if not await check_admin(update, context): return
     
-    target_user = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
+    # Resolve target user info
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
+        return
     
-    warns = await get_warn_count(update.effective_chat.id, target_user.id)
+    warns = await get_warn_count(update.effective_chat.id, target_id)
     await update.message.reply_text(
-        f"User {target_user.mention_html()} has **{warns}** active warnings.",
-        parse_mode="HTML"
+        f"User **{target_name_or_error}** has **{warns}** active warnings.",
+        parse_mode="Markdown"
     )
 
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bans a user from the group."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to ban them.")
+    
+    # Resolve target user info
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
         return
 
-    target_user = update.message.reply_to_message.from_user
     group_id = update.effective_chat.id
-    reason = " ".join(context.args) if context.args else "No reason provided."
+    
+    # Get reason, skipping the target user argument if it was provided
+    if context.args and target_name_or_error.startswith("User ID:") or (context.args and context.args[0].startswith('@')):
+        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason provided."
+    else:
+        reason = " ".join(context.args) if context.args else "No reason provided."
 
     try:
-        await context.bot.ban_chat_member(group_id, target_user.id)
+        await context.bot.ban_chat_member(group_id, target_id)
         # Also remove warnings
-        await update_warn_count(group_id, target_user.id, -await get_warn_count(group_id, target_user.id))
+        await update_warn_count(group_id, target_id, -await get_warn_count(group_id, target_id))
 
         await update.message.reply_text(
-            f"🔨 User {target_user.mention_html()} has been **BANNED**.\nReason: {reason}",
-            parse_mode="HTML"
+            f"🔨 User **{target_name_or_error}** has been **BANNED**.\nReason: {reason}",
+            parse_mode="Markdown"
         )
     except Exception as e:
         await update.message.reply_text(f"Could not ban user. Make sure the bot is an admin with 'ban users' permission. Error: {e}")
@@ -744,15 +904,15 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Unbans a user from the group. User ID must be provided."""
     if not await check_admin(update, context): return
     
+    # Unbanning requires the ID because the user is no longer a chat member.
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Please provide the User ID of the user to unban. Usage: `/unban 123456789`")
+        await update.message.reply_text("⚠️ **Unban requires the numerical User ID** (since the user is banned and cannot be resolved by username). Usage: `/unban 123456789`", parse_mode="Markdown")
         return
 
     target_id = int(context.args[0])
 
     try:
         # The unban function requires a user ID and will only work if the user is currently banned.
-        # Setting until_date to 0 unbans the user.
         await context.bot.unban_chat_member(update.effective_chat.id, target_id)
         await update.message.reply_text(f"🔓 User with ID `{target_id}` has been **UNBANNED**.", parse_mode="Markdown")
     except Exception as e:
@@ -761,20 +921,33 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Mutes a user for a specified duration (default 1 hour)."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to mute them.")
+    
+    # Resolve target user info
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
         return
 
-    target_user = update.message.reply_to_message.from_user
     group_id = update.effective_chat.id
     
     # Default mute duration: 1 hour
     mute_seconds = 3600
     duration_str = "1 hour"
+    duration_arg = None
+    
+    # Determine the argument index based on whether a target was explicitly passed or implied by reply
+    if update.message.reply_to_message:
+        # Target from reply, duration is arg[0] if it exists
+        if context.args and context.args[0].isdigit():
+            duration_arg = context.args[0]
+    else:
+        # Target from arg[0] (ID or @username), duration is arg[1] if it exists
+        if len(context.args) > 1 and context.args[1].isdigit():
+            duration_arg = context.args[1]
 
-    if context.args and context.args[0].isdigit():
-        # User provides minutes
-        mute_minutes = int(context.args[0])
+    if duration_arg:
+        mute_minutes = int(duration_arg)
         mute_seconds = mute_minutes * 60
         duration_str = f"{mute_minutes} minutes"
 
@@ -784,13 +957,13 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Mute means can_send_messages=False, and all other permissions are also set to False by default
         await context.bot.restrict_chat_member(
             group_id,
-            target_user.id,
+            target_id,
             permissions=ChatPermissions(can_send_messages=False),
             until_date=mute_until
         )
         await update.message.reply_text(
-            f"🔇 User {target_user.mention_html()} has been **MUTED** for {duration_str}.",
-            parse_mode="HTML"
+            f"🔇 User **{target_name_or_error}** has been **MUTED** for {duration_str}.",
+            parse_mode="Markdown"
         )
     except Exception as e:
         await update.message.reply_text(f"Could not mute user. Make sure the bot is an admin with 'restrict users' permission. Error: {e}")
@@ -798,19 +971,21 @@ async def mute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Unmutes a user by resetting permissions."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to unmute them.")
+    
+    # Resolve target user info
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
         return
 
-    target_user = update.message.reply_to_message.from_user
     group_id = update.effective_chat.id
 
     try:
         # Give back all default permissions (unmute)
-        # Permissions are all set to True to ensure they can send all types of messages again
         await context.bot.restrict_chat_member(
             group_id,
-            target_user.id,
+            target_id,
             permissions=ChatPermissions(
                 can_send_messages=True,
                 can_send_audios=True,
@@ -825,27 +1000,30 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         )
         await update.message.reply_text(
-            f"🔊 User {target_user.mention_html()} has been **UNMUTED**.",
-            parse_mode="HTML"
+            f"🔊 User **{target_name_or_error}** has been **UNMUTED**.",
+            parse_mode="Markdown"
         )
     except Exception as e:
         await update.message.reply_text(f"Could not unmute user. Error: {e}")
 
 async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Promotes a replied user to administrator."""
+    """Promotes a replied/specified user to administrator."""
     if not await check_admin(update, context): return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Please reply to a user's message to promote them.")
+    
+    # Resolve target user info
+    target_id, target_name_or_error = await get_target_user_info(update, context)
+
+    if not target_id:
+        await update.message.reply_text(target_name_or_error, parse_mode="Markdown")
         return
 
-    target_user = update.message.reply_to_message.from_user
     group_id = update.effective_chat.id
 
     try:
         # Promote the user with no optional permissions granted by default (except basic ones)
         await context.bot.promote_chat_member(
             chat_id=group_id,
-            user_id=target_user.id,
+            user_id=target_id,
             can_manage_chat=True,
             can_delete_messages=True,
             can_restrict_members=True,
@@ -854,8 +1032,8 @@ async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             can_change_info=False
         )
         await update.message.reply_text(
-            f"👑 User {target_user.mention_html()} has been **PROMOTED** to a standard administrator.",
-            parse_mode="HTML"
+            f"👑 User **{target_name_or_error}** has been **PROMOTED** to a standard administrator.",
+            parse_mode="Markdown"
         )
     except Exception as e:
         await update.message.reply_text(f"Could not promote user. Make sure the bot is the group creator or has the 'Add New Admins' permission. Error: {e}")
@@ -1054,25 +1232,28 @@ def main() -> None:
 
     # --- Register Handlers ---
     
+    # AI Chatbot Command
+    application.add_handler(CommandHandler("ask", ask_ai))
+
     # Public/Utility Commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("id", get_user_id))
-    application.add_handler(CommandHandler("purge", purge_messages)) # NEW
+    application.add_handler(CommandHandler("purge", purge_messages)) 
 
     # Countdown Commands
     application.add_handler(CommandHandler("set_countdown", set_countdown))
     application.add_handler(CommandHandler("check_countdown", check_countdown))
 
-    # Link Approval Commands (NEW)
+    # Link Approval Commands
     application.add_handler(CommandHandler("approve", approve_link_sender))
     application.add_handler(CommandHandler("disapprove", disapprove_link_sender))
 
-    # Admin/Management Commands
+    # Admin/Management Commands (Now support reply, @username, or ID)
     application.add_handler(CommandHandler("warn", warn_user))
     application.add_handler(CommandHandler("removewarn", remove_warn))
     application.add_handler(CommandHandler("warns", warn_counts))
     application.add_handler(CommandHandler("ban", ban_user))
-    application.add_handler(CommandHandler("unban", unban_user))
+    application.add_handler(CommandHandler("unban", unban_user)) # ID-only
     application.add_handler(CommandHandler("mute", mute_user))
     application.add_handler(CommandHandler("unmute", unmute_user))
     application.add_handler(CommandHandler("promote", promote_user))
@@ -1091,12 +1272,11 @@ def main() -> None:
     application.add_handler(CommandHandler("broadcast", broadcast_message))
 
     # Message Handlers
-    # 1. Link Handler (MUST RUN BEFORE handle_filters or handle_banned_words to prioritize link moderation)
-    # Checks for entities that represent links (URLs, text links, or user mentions which can be links)
+    # 1. Link Handler 
     link_filters = filters.Entity("url") | filters.Entity("text_link") | filters.Entity("text_mention")
-    application.add_handler(MessageHandler(link_filters, handle_link_messages)) # NEW
+    application.add_handler(MessageHandler(link_filters, handle_link_messages)) 
     
-    # 2. Filter and Banned Word Handlers (only run on TEXT messages that are NOT commands)
+    # 2. Filter and Banned Word Handlers
     text_filters = filters.TEXT & ~filters.COMMAND
     application.add_handler(MessageHandler(text_filters, handle_filters))
     application.add_handler(MessageHandler(text_filters, handle_banned_words))
