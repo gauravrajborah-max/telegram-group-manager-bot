@@ -163,7 +163,12 @@ async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 # The file object returned by reply.photo[-1] or reply.document is a File instance
                 # from telegram.ext, which already has the file_id. We only need to call download_as_bytes.
                 telegram_file = await file_obj.get_file()
-                file_bytes = await telegram_file.download_as_bytes()
+
+                # Use download_to_memory() to get file bytes
+                buffer = io.BytesIO()
+                await telegram_file.download_to_memory(out=buffer)
+                buffer.seek(0)
+                file_bytes = buffer.read()
                 
                 # 2. Encode to Base64
                 image_base64 = base64.b64encode(file_bytes).decode('utf-8')
