@@ -126,6 +126,197 @@ async def get_ai_response(prompt: str, image_base64: str = None, mime_type: str 
     # Use asyncio.to_thread to run the synchronous API call in a thread pool
     return await asyncio.to_thread(sync_api_call, prompt, image_base64, mime_type)
 
+async def interpret_ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
+    """
+    Detects moderation or owner-level commands from AI chat messages and executes them automatically
+    if the sender is an admin or owner.
+    """
+    text = user_text.lower()
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    
+
+    # Ensure only admins or owner can execute these actions
+    if not await check_admin(update, context) and user_id != OWNER_ID:
+        return
+
+    # Helper: identify target user (usually the message replied to)
+    target = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+
+    # Helper: extract duration if mentioned
+    def extract_minutes(text):
+        for w in text.split():
+            if w.isdigit():
+                return int(w)
+        return 1
+
+    # -------------------- Moderation Actions --------------------
+
+    # 1️⃣ BAN
+    if "ban" in text or "remove from group" in text:
+        if target:
+            try:
+                await context.bot.ban_chat_member(chat_id, target.id)
+                await update.message.reply_text(f"🔨 {target.full_name} has been banned.")
+                return
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Could not ban user. {e}")
+                return
+
+    # 2️⃣ UNBAN
+    if "unban" in text or "pardon" in text:
+        for w in text.split():
+            if w.isdigit():
+                try:
+                    await context.bot.unban_chat_member(chat_id, int(w))
+                    await update.message.reply_text(f"🔓 User with ID {w} has been unbanned.")
+                    return
+                except Exception as e:
+                    await update.message.reply_text(f"⚠️ Could not unban user. {e}")
+                    return
+
+    # 3️⃣ KICK
+    if "kick" in text:
+        if target:
+            try:
+                await context.bot.ban_chat_member(chat_id, target.id)
+                await context.bot.unban_chat_member(chat_id, target.id)
+                await update.message.reply_text(f"👢 {target.full_name} was kicked from the group.")
+                return
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Could not kick user. {e}")
+                return
+
+    # 4️⃣ MUTE
+    if "mute" in text and "unmute" not in text:
+        if target:
+            mins = extract_minutes(text)
+            until_time = datetime.now(timezone.utc) + timedelta(minutes=mins)
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id,
+                    target.id,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=until_time,
+                )
+                await update.message.reply_text(f"🔇 {target.full_name} muted for {mins} minutes.")
+                return
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Could not mute user. {e}")
+                return
+
+    # 5️⃣ UNMUTE
+    if "unmute" in text:
+        if target:
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id,
+                    target.id,
+                    permissions=ChatPermissions(can_send_messages=True),
+                )
+                await update.message.reply_text(f"🔊 {target.full_name} has been unmuted.")
+                return
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Could not unmute user. {e}")
+                return
+
+    # 6️⃣ WARN
+    if "warn" in text and "remove" not in text:
+        if target:
+            user_ref = db.collection("warnings").document(str(target.id))
+            doc = user_ref.get()
+            count = doc.to_dict().get("count", 0) + 1 if doc.exists else 1
+            user_ref.set({"count": count})
+            await update.message.reply_text(f"⚠️ {target.full_name} has been warned ({count}/3).")
+            if count >= 3:
+                await context.bot.ban_chat_member(chat_id, target.id)
+                await update.message.reply_text(f"🚫 {target.full_name} banned automatically (3 warnings).")
+            return
+
+    # 7️⃣ REMOVE WARN
+    if "remove warn" in text or "clear warning" in text:
+        if target:
+            user_ref = db.collection("warnings").document(str(target.id))
+            doc = user_ref.get()
+            if doc.exists:
+                count = max(doc.to_dict().get("count", 0) - 1, 0)
+                user_ref.set({"count": count})
+                await update.message.reply_text(f"✅ One warning removed from {target.full_name}. Now at {count}.")
+            else:
+                await update.message.reply_text("ℹ️ This user has no warnings.")
+            return
+
+    # 8️⃣ WARN COUNT
+    if "warn count" in text or "warnings" in text:
+        if target:
+            user_ref = db.collection("warnings").document(str(target.id))
+            doc = user_ref.get()
+            count = doc.to_dict().get("count", 0) if doc.exists else 0
+            await update.message.reply_text(f"⚠️ {target.full_name} has {count} warnings.")
+            return
+
+    # 9️⃣ LOCK MEDIA / STICKERS / LINKS
+    if "lock" in text:
+        perms = ChatPermissions(
+            can_send_messages=True,
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+        )
+
+        if "media" in text:
+            perms.can_send_photos = False
+            perms.can_send_videos = False
+            perms.can_send_documents = False
+        if "stickers" in text:
+            perms.can_send_other_messages = False
+        if "links" in text or "url" in text:
+            perms.can_add_web_page_previews = False
+
+        try:
+            await context.bot.set_chat_permissions(chat_id, perms)
+            await update.message.reply_text("🔒 Group restrictions updated.")
+            return
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Could not change group permissions. {e}")
+            return
+
+    # 🔟 UNLOCK
+    if "unlock" in text:
+        perms = ChatPermissions(
+            can_send_messages=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_documents=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+        )
+        try:
+            await context.bot.set_chat_permissions(chat_id, perms)
+            await update.message.reply_text("🔓 All restrictions lifted.")
+            return
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Could not unlock. {e}")
+            return
+
+    # 1️⃣1️⃣ BROADCAST (OWNER ONLY)
+    if user_id == OWNER_ID and ("broadcast" in text or "send to all" in text):
+        message_to_send = text.replace("broadcast", "").replace("send to all", "").strip()
+        users_ref = db.collection("users").stream()
+        count = 0
+        for user in users_ref:
+            uid = user.id
+            try:
+                await context.bot.send_message(chat_id=uid, text=message_to_send)
+                count += 1
+            except:
+                pass
+        await update.message.reply_text(f"📢 Message sent to {count} users.")
+        return
+
 
 async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -218,7 +409,7 @@ async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     # Send the final response
     await update.message.reply_text(response_text)
-
+    await interpret_ai_command(update, context, prompt)
 
 # --- Helper Functions (Checks and Database Interactions) ---
 
