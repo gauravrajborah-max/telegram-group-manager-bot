@@ -131,6 +131,9 @@ async def interpret_ai_command(update: Update, context: ContextTypes.DEFAULT_TYP
     Detects moderation or owner-level commands from AI chat messages and executes them automatically
     if the sender is an admin or owner.
     """
+    from datetime import datetime, timedelta, timezone
+    from telegram import ChatPermissions
+    
     text = user_text.lower()
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
@@ -301,6 +304,67 @@ async def interpret_ai_command(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             await update.message.reply_text(f"⚠️ Could not unlock. {e}")
             return
+
+    if ("make admin" in text or "promote" in text) and target:
+        try:
+            await context.bot.promote_chat_member(
+                chat_id, target.id,
+                can_change_info=True, can_delete_messages=True,
+                can_restrict_members=True, can_invite_users=True,
+                can_pin_messages=True, can_manage_chat=True,
+            )
+            await update.message.reply_text(f"🛡️ {target.full_name} promoted to admin.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Could not promote. {e}")
+        return
+
+    if ("remove admin" in text or "demote" in text) and target:
+        try:
+            await context.bot.promote_chat_member(
+                chat_id, target.id,
+                can_change_info=False, can_delete_messages=False,
+                can_restrict_members=False, can_invite_users=False,
+                can_pin_messages=False, can_manage_chat=False,
+            )
+            await update.message.reply_text(f"🧱 {target.full_name} demoted to member.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Could not demote. {e}")
+        return
+
+    # -------------------- Approve / Disapprove --------------------
+    if "approve" in text and target:
+        db.collection("approved").document(str(target.id)).set({"approved": True})
+        await update.message.reply_text(f"✅ {target.full_name} has been approved.")
+        return
+
+    if "disapprove" in text and target:
+        db.collection("approved").document(str(target.id)).set({"approved": False})
+        await update.message.reply_text(f"🚫 {target.full_name} has been disapproved.")
+        return
+
+    # -------------------- Countdown System --------------------
+    if "set countdown" in text:
+        minutes = extract_minutes(text)
+        end_time = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        db.collection("countdowns").document(str(chat_id)).set({"end_time": end_time.isoformat()})
+        await update.message.reply_text(f"⏳ Countdown started for {minutes} minutes.")
+        return
+
+    if "check countdown" in text:
+        doc = db.collection("countdowns").document(str(chat_id)).get()
+        if doc.exists:
+            end_time = datetime.fromisoformat(doc.to_dict().get("end_time"))
+            remaining = (end_time - datetime.now(timezone.utc)).total_seconds()
+            if remaining > 0:
+                mins = int(remaining // 60)
+                secs = int(remaining % 60)
+                await update.message.reply_text(f"⏱️ {mins}m {secs}s remaining.")
+            else:
+                await update.message.reply_text("⏰ Countdown ended.")
+        else:
+            await update.message.reply_text("ℹ️ No active countdown found.")
+        return
+
 
     # 1️⃣1️⃣ BROADCAST (OWNER ONLY)
     if user_id == OWNER_ID and ("broadcast" in text or "send to all" in text):
