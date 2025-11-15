@@ -1110,40 +1110,7 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"Could not unmute user. Error: {e}")
 
-async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    bot = context.bot
 
-    if chat.type not in ["group", "supergroup"]:
-        await update.message.reply_text("This command only works in groups.")
-        return
-
-    try:
-        admin_list = await bot.get_chat_administrators(chat.id)
-        admin_ids = [admin.user.id for admin in admin_list]
-
-        recent_users = {}
-
-        async for msg in bot.get_chat_history(chat.id, limit=200):
-            if msg.from_user and not msg.from_user.is_bot:
-                recent_users[msg.from_user.id] = msg.from_user
-
-        final_users = list(set(list(recent_users.values()) + [a.user for a in admin_list if not a.user.is_bot]))
-
-        if not final_users:
-            await update.message.reply_text("Couldn't find users to mention.")
-            return
-
-        mention_text = " ".join([
-            f"<a href='tg://user?id={u.id}'>{u.first_name}</a>"
-            for u in final_users
-        ])
-
-        await update.message.reply_text(f"📣 <b>Everyone:</b>\n{mention_text}", parse_mode="HTML")
-
-    except Exception as e:
-        print(e)
-        await update.message.reply_text("Something went wrong.")
 
 
 async def mention_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
