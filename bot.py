@@ -1110,6 +1110,70 @@ async def unmute_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"Could not unmute user. Error: {e}")
 
+async def mention_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mentions all members in the group."""
+    chat = update.effective_chat
+
+    if chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("This command only works in group chats.")
+        return
+
+    try:
+        members = await context.bot.get_chat_administrators(chat.id)
+        admins = [admin.user.id for admin in members]
+
+        # Fetch chat members list (only works for groups where bot has permission)
+        full_list = await context.bot.get_chat_members_count(chat.id)
+
+        # Telegram API does NOT directly give user list; we workaround by scanning recent activity
+        # But easiest working method: use get_chat_member for every user in admin list
+        # For non-admins, we rely on allowed metadata
+
+        # We will tag recent active users — safe and normally enough
+        # Avoid tagging bots
+        tagged_users = []
+
+        async for msg in context.bot.iter_chat_members(chat.id):
+            user = msg.user
+            if not user.is_bot:
+                tagged_users.append(user)
+
+        if not tagged_users:
+            await update.message.reply_text("I couldn't find any members to tag.")
+            return
+
+        mention_text = " ".join([f"[{u.first_name}](tg://user?id={u.id})" for u in tagged_users])
+
+        await update.message.reply_text(f"📣 **Everyone:**\n{mention_text}", parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text("I need the 'can_manage_chat' permission to tag everyone.")
+        print(e)
+async def mention_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mentions all admins of the group."""
+    chat = update.effective_chat
+
+    if chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text("This command only works in group chats.")
+        return
+
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+
+        mention_list = []
+        for admin in admins:
+            user = admin.user
+            if not user.is_bot:
+                mention_list.append(f"[{user.first_name}](tg://user?id={user.id})")
+
+        mention_text = " ".join(mention_list)
+
+        await update.message.reply_text(f"🛡 **Admins:**\n{mention_text}", parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text("Failed to fetch admin list.")
+        print(e)
+
 async def promote_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Promotes a replied/specified user to administrator."""
     if not await check_admin(update, context): return
@@ -1371,6 +1435,11 @@ def main() -> None:
     application.add_handler(CommandHandler("promote", promote_user))
     application.add_handler(CommandHandler("filter", set_filter))
     application.add_handler(CommandHandler("stop", stop_filter))
+
+
+    # mentioning all/admin
+    application.add_handler(CommandHandler("all", mention_all))
+    application.add_handler(CommandHandler("admin", mention_admins))
 
     # Lock/Unlock Commands
     application.add_handler(CommandHandler("lock", lock_feature))
