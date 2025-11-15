@@ -1398,8 +1398,7 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", stop_filter))
 
 
-    # mentioning all/admin
-    application.add_handler(CommandHandler("all", mention_all))
+    # mentioning admin
     application.add_handler(CommandHandler("admin", mention_admins))
 
     # Lock/Unlock Commands
